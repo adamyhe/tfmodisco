@@ -3,6 +3,7 @@
 # adapted from code written by Avanti Shrikumar 
 
 from enum import Enum
+import time
 import textwrap
 from typing import List
 import numpy as np
@@ -18,6 +19,74 @@ class MemeDataType(Enum):
 
 	def __str__(self):
 		return self.value
+
+
+class _NullProfileTimer:
+	def __enter__(self):
+		return self
+
+	def __exit__(self, exc_type, exc_value, traceback):
+		return False
+
+
+class _ProfileTimer:
+	def __init__(self, recorder, name):
+		self.recorder = recorder
+		self.name = name
+		self.start = None
+
+	def __enter__(self):
+		self.start = time.perf_counter()
+		return self
+
+	def __exit__(self, exc_type, exc_value, traceback):
+		self.recorder.add(self.name, time.perf_counter() - self.start)
+		return False
+
+
+class ProfileRecorder:
+	def __init__(self, enabled=True):
+		self.enabled = enabled
+		self.records = []
+
+	def time(self, name):
+		if not self.enabled:
+			return _NullProfileTimer()
+
+		return _ProfileTimer(self, name)
+
+	def add(self, name, seconds):
+		self.records.append((name, seconds))
+
+	def summary(self):
+		summary = {}
+		for name, seconds in self.records:
+			if name not in summary:
+				summary[name] = {"count": 0, "seconds": 0.0}
+
+			summary[name]["count"] += 1
+			summary[name]["seconds"] += seconds
+
+		return summary
+
+	def format_summary(self):
+		lines = []
+		for name, values in self.summary().items():
+			lines.append("{}: {:.6f}s over {} call(s)".format(
+				name, values["seconds"], values["count"]))
+
+		return lines
+
+	def print_summary(self):
+		for line in self.format_summary():
+			print(line)
+
+
+def ensure_profile_recorder(profile):
+	if isinstance(profile, ProfileRecorder):
+		return profile
+
+	return ProfileRecorder(enabled=bool(profile))
 
 
 

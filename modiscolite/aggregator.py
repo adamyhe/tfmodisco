@@ -234,6 +234,37 @@ def SimilarPatternsCollapser(patterns, track_set,
 
 			subsample_patterns.append(pattern)
 
+		flat_pattern_cache = {}
+		within_pattern_sims_cache = {}
+		auroc_label_cache = {}
+
+		def get_flat_pattern_data(pattern_idx):
+			if pattern_idx not in flat_pattern_cache:
+				pattern_fwdseqdata, _ = util.get_2d_data_from_patterns(
+					subsample_patterns[pattern_idx].seqlets)
+				flat_pattern_cache[pattern_idx] = pattern_fwdseqdata.reshape(
+					(len(pattern_fwdseqdata), -1))
+
+			return flat_pattern_cache[pattern_idx]
+
+		def get_within_pattern_sims(pattern_idx):
+			if pattern_idx not in within_pattern_sims_cache:
+				flat_pattern_fwdseqdata = get_flat_pattern_data(pattern_idx)
+				within_pattern_sims_cache[pattern_idx] = affinitymat.jaccard(
+					flat_pattern_fwdseqdata[:, :, None],
+					flat_pattern_fwdseqdata[:, :, None])[:, :, 0].flatten()
+
+			return within_pattern_sims_cache[pattern_idx]
+
+		def get_auroc_labels(n_between, n_within):
+			key = (n_between, n_within)
+			if key not in auroc_label_cache:
+				auroc_label_cache[key] = np.concatenate([
+					np.zeros(n_between, dtype='int8'),
+					np.ones(n_within, dtype='int8')])
+
+			return auroc_label_cache[key]
+
 		n = len(patterns)
 		for i in range(n):
 			for j in range(n):
@@ -281,15 +312,11 @@ def SimilarPatternsCollapser(patterns, track_set,
 				pattern2_shifted_seqlets = track_set.create_seqlets(
 					seqlets=pattern2_coords)
 
-				pattern1_fwdseqdata, _ =\
-				  util.get_2d_data_from_patterns(subsample_patterns[i].seqlets)
-
 				pattern2_fwdseqdata, _ =\
 				  util.get_2d_data_from_patterns(pattern2_shifted_seqlets)
 
 				#Flatten, compute continjacc sim at this alignment
-				flat_pattern1_fwdseqdata = pattern1_fwdseqdata.reshape(
-					(len(pattern1_fwdseqdata), -1))
+				flat_pattern1_fwdseqdata = get_flat_pattern_data(i)
 				flat_pattern2_fwdseqdata = pattern2_fwdseqdata.reshape(
 					(len(pattern2_fwdseqdata), -1))
 
@@ -297,15 +324,13 @@ def SimilarPatternsCollapser(patterns, track_set,
 					flat_pattern1_fwdseqdata[:, :, None], 
 					flat_pattern2_fwdseqdata[:, :, None])[:, :, 0].flatten()
 
-				within_pattern1_sims = affinitymat.jaccard(
-					flat_pattern1_fwdseqdata[:, :, None], 
-					flat_pattern1_fwdseqdata[:, :, None])[:, :, 0].flatten()
+				within_pattern1_sims = get_within_pattern_sims(i)
 
 				auroc = roc_auc_score(
-					y_true=[0 for x in between_pattern_sims]
-						   +[1 for x in within_pattern1_sims],
-					y_score=list(between_pattern_sims)
-							+list(within_pattern1_sims))
+					y_true=get_auroc_labels(
+						len(between_pattern_sims), len(within_pattern1_sims)),
+					y_score=np.concatenate([
+						between_pattern_sims, within_pattern1_sims]))
 
 				#The symmetrization over i,j and j,i is done later
 				pairwise_aurocs[i,j] = auroc

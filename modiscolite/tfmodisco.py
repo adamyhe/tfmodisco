@@ -15,8 +15,9 @@ from . import extract_seqlets
 from . import core
 from . import util
 from . import cluster
+from numba import njit
 
-def _density_adaptation(affmat_nn, seqlet_neighbors, tsne_perplexity):
+def _density_adaptation_reference(affmat_nn, seqlet_neighbors, tsne_perplexity):
 	eps = 0.0000001
 
 	rows, cols, data = [], [], []
@@ -56,6 +57,88 @@ def _density_adaptation(affmat_nn, seqlet_neighbors, tsne_perplexity):
 	affmat_diags = scipy.sparse.diags(1.0 / normfactors)
 	affmat_nn += affmat_diags
 	return affmat_nn
+
+
+@njit
+def _csr_density_adaptation_params(data, indices, indptr, tsne_perplexity):
+	n = len(indptr) - 1
+	betas = np.empty(n, dtype=np.float64)
+	normfactors = np.empty(n, dtype=np.float64)
+
+	for i in range(n):
+		row = data[indptr[i]:indptr[i+1]]
+		beta = util.binary_search_perplexity(tsne_perplexity, row)
+		betas[i] = beta
+		normfactors[i] = np.exp(-row / beta).sum() + 1
+
+	return betas, normfactors
+
+
+@njit
+def _csr_apply_density_adaptation(data, indices, indptr, betas, normfactors):
+	for i in range(len(indptr) - 1):
+		for j_idx in range(indptr[i], indptr[i+1]):
+			j = indices[j_idx]
+			distance = data[j_idx]
+
+			rbf_i = np.exp(-distance / betas[i]) / normfactors[i]
+			rbf_j = np.exp(-distance / betas[j]) / normfactors[j]
+
+			data[j_idx] = np.sqrt(rbf_i * rbf_j)
+
+
+def _density_adaptation_optimized(affmat_nn, seqlet_neighbors, tsne_perplexity):
+	eps = 0.0000001
+
+	affmat_nn = np.asarray(affmat_nn, dtype='float64')
+	seqlet_neighbors = np.asarray(seqlet_neighbors)
+
+	n, k = affmat_nn.shape
+	rows = np.repeat(np.arange(n, dtype='int64'), k)
+	cols = seqlet_neighbors.reshape(-1)
+	data = affmat_nn.reshape(-1)
+
+	affmat_nn = scipy.sparse.csr_matrix((data, (rows, cols)), 
+		shape=(n, n), dtype='float64')
+	
+	affmat_nn.data = np.maximum(np.log((1.0/(0.5*np.maximum(affmat_nn.data, eps)))-1), 0)
+	affmat_nn.eliminate_zeros()
+
+	counts_nn = scipy.sparse.csr_matrix((np.ones_like(affmat_nn.data), 
+		affmat_nn.indices, affmat_nn.indptr), shape=affmat_nn.shape, dtype='float64')
+
+	affmat_nn += affmat_nn.T
+	counts_nn += counts_nn.T
+	affmat_nn.data /= counts_nn.data
+	del counts_nn
+
+	betas, normfactors = _csr_density_adaptation_params(
+		affmat_nn.data, affmat_nn.indices, affmat_nn.indptr,
+		tsne_perplexity)
+
+	_csr_apply_density_adaptation(
+		affmat_nn.data, affmat_nn.indices, affmat_nn.indptr,
+		betas, normfactors)
+
+	affmat_diags = scipy.sparse.diags(1.0 / normfactors)
+	affmat_nn += affmat_diags
+	return affmat_nn
+
+
+def _density_adaptation(affmat_nn, seqlet_neighbors, tsne_perplexity,
+	backend='auto'):
+
+	if backend == 'auto':
+		backend = 'optimized' if len(affmat_nn) >= 2000 else 'reference'
+
+	if backend == 'reference':
+		return _density_adaptation_reference(
+			affmat_nn, seqlet_neighbors, tsne_perplexity)
+	elif backend == 'optimized':
+		return _density_adaptation_optimized(
+			affmat_nn, seqlet_neighbors, tsne_perplexity)
+	else:
+		raise ValueError("Unrecognized backend: {}".format(backend))
 
 
 def _filter_patterns(patterns, min_seqlet_support, window_size, 
@@ -162,7 +245,12 @@ def seqlets_to_patterns(seqlets, track_set, track_signs=None,
 	prob_and_pertrack_sim_dealbreaker_thresholds=[(0.4, 0.75), (0.2,0.8), (0.1, 0.85), (0.0,0.9)],
 	subcluster_perplexity=50, merging_max_seqlets_subsample=1000,
 	final_min_cluster_size=20,min_ic_in_window=0.6, min_ic_windowsize=6,
-	ppm_pseudocount=0.001):
+	ppm_pseudocount=0.001, profile=False,
+	coarse_affinity_backend='auto', fine_affinity_backend='max_only',
+	density_adaptation_backend='auto'):
+
+	print_profile_summary = bool(profile) and not isinstance(profile, util.ProfileRecorder)
+	profiler = util.ensure_profile_recorder(profile)
 
 	bg_freq = np.mean([seqlet.sequence for seqlet in seqlets], axis=(0, 1)) 
 
@@ -176,19 +264,24 @@ def seqlets_to_patterns(seqlets, track_set, track_signs=None,
 			return None
 
 		# Step 1: Generate coarse resolution
-		coarse_affmat_nn, seqlet_neighbors = affinitymat.cosine_similarity_from_seqlets(
-			seqlets=seqlets, n_neighbors=nearest_neighbors_to_compute, sign=track_signs)
+		with profiler.time("seqlets_to_patterns.coarse_affinity"):
+			coarse_affmat_nn, seqlet_neighbors = affinitymat.cosine_similarity_from_seqlets(
+				seqlets=seqlets, n_neighbors=nearest_neighbors_to_compute,
+				sign=track_signs, backend=coarse_affinity_backend)
 
 		# Step 2: Generate fine representation
-		fine_affmat_nn = affinitymat.jaccard_from_seqlets(
-			seqlets=seqlets, seqlet_neighbors=seqlet_neighbors,
-			min_overlap=min_overlap_while_sliding)
+		with profiler.time("seqlets_to_patterns.fine_affinity"):
+			fine_affmat_nn = affinitymat.jaccard_from_seqlets(
+				seqlets=seqlets, seqlet_neighbors=seqlet_neighbors,
+				min_overlap=min_overlap_while_sliding,
+				sparse_backend=fine_affinity_backend)
 
 		if round_idx == 0:
-			filtered_seqlets, seqlet_neighbors, filtered_affmat_nn = (
-				_filter_by_correlation(seqlets, seqlet_neighbors, 
-					coarse_affmat_nn, fine_affmat_nn, 
-					affmat_correlation_threshold))
+			with profiler.time("seqlets_to_patterns.filter_by_correlation"):
+				filtered_seqlets, seqlet_neighbors, filtered_affmat_nn = (
+					_filter_by_correlation(seqlets, seqlet_neighbors, 
+						coarse_affmat_nn, fine_affmat_nn, 
+						affmat_correlation_threshold))
 		else:
 			filtered_seqlets = seqlets
 			filtered_affmat_nn = fine_affmat_nn
@@ -198,30 +291,34 @@ def seqlets_to_patterns(seqlets, track_set, track_signs=None,
 		del seqlets
 
 		# Step 4: Density adaptation
-		csr_density_adapted_affmat = _density_adaptation(
-			filtered_affmat_nn, seqlet_neighbors, tsne_perplexity)
+		with profiler.time("seqlets_to_patterns.density_adaptation"):
+			csr_density_adapted_affmat = _density_adaptation(
+				filtered_affmat_nn, seqlet_neighbors, tsne_perplexity,
+				backend=density_adaptation_backend)
 
 		del filtered_affmat_nn
 		del seqlet_neighbors
 
 		# Step 5: Clustering
-		cluster_indices = cluster.LeidenCluster(
-			csr_density_adapted_affmat,
-			n_seeds=n_leiden_runs,
-			n_leiden_iterations=n_leiden_iterations)
+		with profiler.time("seqlets_to_patterns.leiden_cluster"):
+			cluster_indices = cluster.LeidenCluster(
+				csr_density_adapted_affmat,
+				n_seeds=n_leiden_runs,
+				n_leiden_iterations=n_leiden_iterations)
 
 		del csr_density_adapted_affmat
 
-		patterns = _patterns_from_clusters(filtered_seqlets, 
-			track_set=track_set, 
-			min_overlap=min_overlap_while_sliding, 
-			min_frac=frac_support_to_trim_to, 
-			min_num=min_num_to_trim_to, 
-			flank_to_add=initial_flank_to_add, 
-			window_size=trim_to_window_size, 
-			bg_freq=bg_freq, 
-			cluster_indices=cluster_indices, 
-			track_sign=track_signs)
+		with profiler.time("seqlets_to_patterns.patterns_from_clusters"):
+			patterns = _patterns_from_clusters(filtered_seqlets, 
+				track_set=track_set, 
+				min_overlap=min_overlap_while_sliding, 
+				min_frac=frac_support_to_trim_to, 
+				min_num=min_num_to_trim_to, 
+				flank_to_add=initial_flank_to_add, 
+				window_size=trim_to_window_size, 
+				bg_freq=bg_freq, 
+				cluster_indices=cluster_indices, 
+				track_sign=track_signs)
 
 		#obtain unique seqlets from adjusted motifs
 		seqlets = list(dict([(y.string, y)
@@ -229,17 +326,18 @@ def seqlets_to_patterns(seqlets, track_set, track_signs=None,
 
 	del seqlets
 
-	merged_patterns, pattern_merge_hierarchy = aggregator._detect_spurious_merging(
-		patterns=patterns, track_set=track_set, perplexity=subcluster_perplexity, 
-		min_in_subcluster=max(final_min_cluster_size, subcluster_perplexity), 
-		min_overlap=min_overlap_while_sliding,
-		prob_and_pertrack_sim_merge_thresholds=prob_and_pertrack_sim_merge_thresholds,
-		prob_and_pertrack_sim_dealbreaker_thresholds=prob_and_pertrack_sim_dealbreaker_thresholds,
-		min_frac=frac_support_to_trim_to, min_num=min_num_to_trim_to,
-		flank_to_add=initial_flank_to_add,
-		window_size=trim_to_window_size, bg_freq=bg_freq,
-		max_seqlets_subsample=merging_max_seqlets_subsample,
-		n_seeds=n_leiden_runs)
+	with profiler.time("seqlets_to_patterns.detect_spurious_merging"):
+		merged_patterns, pattern_merge_hierarchy = aggregator._detect_spurious_merging(
+			patterns=patterns, track_set=track_set, perplexity=subcluster_perplexity, 
+			min_in_subcluster=max(final_min_cluster_size, subcluster_perplexity), 
+			min_overlap=min_overlap_while_sliding,
+			prob_and_pertrack_sim_merge_thresholds=prob_and_pertrack_sim_merge_thresholds,
+			prob_and_pertrack_sim_dealbreaker_thresholds=prob_and_pertrack_sim_dealbreaker_thresholds,
+			min_frac=frac_support_to_trim_to, min_num=min_num_to_trim_to,
+			flank_to_add=initial_flank_to_add,
+			window_size=trim_to_window_size, bg_freq=bg_freq,
+			max_seqlets_subsample=merging_max_seqlets_subsample,
+			n_seeds=n_leiden_runs)
 
 	#Now start merging patterns 
 	merged_patterns = sorted(merged_patterns, key=lambda x: -len(x.seqlets))
@@ -255,10 +353,15 @@ def seqlets_to_patterns(seqlets, track_set, track_signs=None,
 			left_flank_to_add=final_flank_to_add,
 			right_flank_to_add=final_flank_to_add)
 
-		pattern.compute_subpatterns(subcluster_perplexity, 
-			n_seeds=n_leiden_runs, n_iterations=n_leiden_iterations)
+		with profiler.time("seqlets_to_patterns.final_compute_subpatterns"):
+			pattern.compute_subpatterns(subcluster_perplexity, 
+				n_seeds=n_leiden_runs, n_iterations=n_leiden_iterations,
+				profile=profiler)
 		
 		patterns[patternidx] = pattern
+
+	if print_profile_summary:
+		profiler.print_summary()
 
 	return patterns
 
@@ -276,7 +379,12 @@ def TFMoDISco(one_hot, hypothetical_contribs, sliding_window_size=21,
 	prob_and_pertrack_sim_dealbreaker_thresholds=[(0.4, 0.75), (0.2,0.8), (0.1, 0.85), (0.0,0.9)],
 	subcluster_perplexity=50, merging_max_seqlets_subsample=1000,
 	final_min_cluster_size=20, min_ic_in_window=0.6, min_ic_windowsize=6,
-	ppm_pseudocount=0.001, verbose=False):
+	ppm_pseudocount=0.001, verbose=False, profile=False,
+	coarse_affinity_backend='auto', fine_affinity_backend='max_only',
+	density_adaptation_backend='auto'):
+
+	print_profile_summary = bool(profile) and not isinstance(profile, util.ProfileRecorder)
+	profiler = util.ensure_profile_recorder(profile)
 
 	contrib_scores = np.multiply(one_hot, hypothetical_contribs)
 
@@ -284,15 +392,16 @@ def TFMoDISco(one_hot, hypothetical_contribs, sliding_window_size=21,
 		contrib_scores=contrib_scores,
 		hypothetical_contribs=hypothetical_contribs)
 
-	seqlet_coords, threshold = extract_seqlets.extract_seqlets(
-		attribution_scores=contrib_scores.sum(axis=2),
-		window_size=sliding_window_size,
-		flank=flank_size,
-		suppress=(int(0.5*sliding_window_size) + flank_size),
-		target_fdr=target_seqlet_fdr,
-		min_passing_windows_frac=min_passing_windows_frac,
-		max_passing_windows_frac=max_passing_windows_frac,
-		weak_threshold_for_counting_sign=weak_threshold_for_counting_sign) 
+	with profiler.time("TFMoDISco.extract_seqlets"):
+		seqlet_coords, threshold = extract_seqlets.extract_seqlets(
+			attribution_scores=contrib_scores.sum(axis=2),
+			window_size=sliding_window_size,
+			flank=flank_size,
+			suppress=(int(0.5*sliding_window_size) + flank_size),
+			target_fdr=target_seqlet_fdr,
+			min_passing_windows_frac=min_passing_windows_frac,
+			max_passing_windows_frac=max_passing_windows_frac,
+			weak_threshold_for_counting_sign=weak_threshold_for_counting_sign) 
 
 	seqlets = track_set.create_seqlets(seqlet_coords) 
 
@@ -313,28 +422,33 @@ def TFMoDISco(one_hot, hypothetical_contribs, sliding_window_size=21,
 		if verbose:
 			print("Using {} positive seqlets".format(len(pos_seqlets)))
 
-		pos_patterns = seqlets_to_patterns(seqlets=pos_seqlets,
-			track_set=track_set, 
-			track_signs=1,
-			min_overlap_while_sliding=min_overlap_while_sliding,
-			nearest_neighbors_to_compute=nearest_neighbors_to_compute,
-			affmat_correlation_threshold=affmat_correlation_threshold,
-			tsne_perplexity=tsne_perplexity,
-			n_leiden_iterations=n_leiden_iterations,
-			n_leiden_runs=n_leiden_runs,
-			frac_support_to_trim_to=frac_support_to_trim_to,
-			min_num_to_trim_to=min_num_to_trim_to,
-			trim_to_window_size=trim_to_window_size,
-			initial_flank_to_add=initial_flank_to_add,
-			final_flank_to_add=final_flank_to_add,
-			prob_and_pertrack_sim_merge_thresholds=prob_and_pertrack_sim_merge_thresholds,
-			prob_and_pertrack_sim_dealbreaker_thresholds=prob_and_pertrack_sim_dealbreaker_thresholds,
-			subcluster_perplexity=subcluster_perplexity,
-			merging_max_seqlets_subsample=merging_max_seqlets_subsample,
-			final_min_cluster_size=final_min_cluster_size,
-			min_ic_in_window=min_ic_in_window,
-			min_ic_windowsize=min_ic_windowsize,
-			ppm_pseudocount=ppm_pseudocount)
+		with profiler.time("TFMoDISco.positive_seqlets_to_patterns"):
+			pos_patterns = seqlets_to_patterns(seqlets=pos_seqlets,
+				track_set=track_set, 
+				track_signs=1,
+				min_overlap_while_sliding=min_overlap_while_sliding,
+				nearest_neighbors_to_compute=nearest_neighbors_to_compute,
+				affmat_correlation_threshold=affmat_correlation_threshold,
+				tsne_perplexity=tsne_perplexity,
+				n_leiden_iterations=n_leiden_iterations,
+				n_leiden_runs=n_leiden_runs,
+				frac_support_to_trim_to=frac_support_to_trim_to,
+				min_num_to_trim_to=min_num_to_trim_to,
+				trim_to_window_size=trim_to_window_size,
+				initial_flank_to_add=initial_flank_to_add,
+				final_flank_to_add=final_flank_to_add,
+				prob_and_pertrack_sim_merge_thresholds=prob_and_pertrack_sim_merge_thresholds,
+				prob_and_pertrack_sim_dealbreaker_thresholds=prob_and_pertrack_sim_dealbreaker_thresholds,
+				subcluster_perplexity=subcluster_perplexity,
+				merging_max_seqlets_subsample=merging_max_seqlets_subsample,
+				final_min_cluster_size=final_min_cluster_size,
+				min_ic_in_window=min_ic_in_window,
+				min_ic_windowsize=min_ic_windowsize,
+				ppm_pseudocount=ppm_pseudocount,
+				profile=profiler,
+				coarse_affinity_backend=coarse_affinity_backend,
+				fine_affinity_backend=fine_affinity_backend,
+				density_adaptation_backend=density_adaptation_backend)
 	else:
 		pos_patterns = None
 
@@ -343,29 +457,37 @@ def TFMoDISco(one_hot, hypothetical_contribs, sliding_window_size=21,
 		if verbose:
 			print("Extracted {} negative seqlets".format(len(neg_seqlets)))
 
-		neg_patterns = seqlets_to_patterns(seqlets=neg_seqlets,
-			track_set=track_set, 
-			track_signs=-1,
-			min_overlap_while_sliding=min_overlap_while_sliding,
-			nearest_neighbors_to_compute=nearest_neighbors_to_compute,
-			affmat_correlation_threshold=affmat_correlation_threshold,
-			tsne_perplexity=tsne_perplexity,
-			n_leiden_iterations=n_leiden_iterations,
-			n_leiden_runs=n_leiden_runs,
-			frac_support_to_trim_to=frac_support_to_trim_to,
-			min_num_to_trim_to=min_num_to_trim_to,
-			trim_to_window_size=trim_to_window_size,
-			initial_flank_to_add=initial_flank_to_add,
-			final_flank_to_add=final_flank_to_add,
-			prob_and_pertrack_sim_merge_thresholds=prob_and_pertrack_sim_merge_thresholds,
-			prob_and_pertrack_sim_dealbreaker_thresholds=prob_and_pertrack_sim_dealbreaker_thresholds,
-			subcluster_perplexity=subcluster_perplexity,
-			merging_max_seqlets_subsample=merging_max_seqlets_subsample,
-			final_min_cluster_size=final_min_cluster_size,
-			min_ic_in_window=min_ic_in_window,
-			min_ic_windowsize=min_ic_windowsize,
-			ppm_pseudocount=ppm_pseudocount)
+		with profiler.time("TFMoDISco.negative_seqlets_to_patterns"):
+			neg_patterns = seqlets_to_patterns(seqlets=neg_seqlets,
+				track_set=track_set, 
+				track_signs=-1,
+				min_overlap_while_sliding=min_overlap_while_sliding,
+				nearest_neighbors_to_compute=nearest_neighbors_to_compute,
+				affmat_correlation_threshold=affmat_correlation_threshold,
+				tsne_perplexity=tsne_perplexity,
+				n_leiden_iterations=n_leiden_iterations,
+				n_leiden_runs=n_leiden_runs,
+				frac_support_to_trim_to=frac_support_to_trim_to,
+				min_num_to_trim_to=min_num_to_trim_to,
+				trim_to_window_size=trim_to_window_size,
+				initial_flank_to_add=initial_flank_to_add,
+				final_flank_to_add=final_flank_to_add,
+				prob_and_pertrack_sim_merge_thresholds=prob_and_pertrack_sim_merge_thresholds,
+				prob_and_pertrack_sim_dealbreaker_thresholds=prob_and_pertrack_sim_dealbreaker_thresholds,
+				subcluster_perplexity=subcluster_perplexity,
+				merging_max_seqlets_subsample=merging_max_seqlets_subsample,
+				final_min_cluster_size=final_min_cluster_size,
+				min_ic_in_window=min_ic_in_window,
+				min_ic_windowsize=min_ic_windowsize,
+				ppm_pseudocount=ppm_pseudocount,
+				profile=profiler,
+				coarse_affinity_backend=coarse_affinity_backend,
+				fine_affinity_backend=fine_affinity_backend,
+				density_adaptation_backend=density_adaptation_backend)
 	else:
 		neg_patterns = None
+
+	if print_profile_summary:
+		profiler.print_summary()
 
 	return pos_patterns, neg_patterns

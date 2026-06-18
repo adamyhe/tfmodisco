@@ -64,9 +64,239 @@ def _sparse_mm_dot(X_data, X_indices, X_indptr, Y_data, Y_indices, Y_indptr, k):
 
 	return sims, neighbors
 
+@njit
+def _argsort_stable_numba(scores, k):
+	idxs = np.argsort(-scores, kind='mergesort')[:k]
+	result = np.empty(k, dtype='int32')
+	for i in range(k):
+		result[i] = idxs[i]
+
+	return result
+
+@njit
+def _topk_stable_numba(scores, k):
+	n = len(scores)
+	if k >= n or n < 2000:
+		return _argsort_stable_numba(scores, min(k, n))
+
+	kth_score = np.partition(scores, n-k)[n-k]
+	above_idxs = np.empty(k, dtype='int32')
+	above_scores = np.empty(k, dtype='float64')
+	n_above = 0
+
+	for idx in range(n):
+		score = scores[idx]
+		if score > kth_score:
+			above_scores[n_above] = score
+			above_idxs[n_above] = idx
+			n_above += 1
+
+	result = np.empty(k, dtype='int32')
+	above_order = np.argsort(-above_scores[:n_above], kind='mergesort')
+	for idx in range(n_above):
+		result[idx] = above_idxs[above_order[idx]]
+
+	result_idx = n_above
+	for idx in range(n):
+		if scores[idx] == kth_score:
+			result[result_idx] = idx
+			result_idx += 1
+			if result_idx == k:
+				break
+
+	return result
+
+def _topk_stable(scores, k):
+	if k >= len(scores) or len(scores) < 2000:
+		return np.argsort(-scores, kind='mergesort')[:k]
+
+	kth_score = np.partition(scores, len(scores)-k)[len(scores)-k]
+	above = np.flatnonzero(scores > kth_score)
+	tied = np.flatnonzero(scores == kth_score)
+	above = above[np.argsort(-scores[above], kind='mergesort')]
+	return np.concatenate([above, tied[:k-len(above)]])
+
+def _merge_sparse_rows_to_dense(X_row, Y_row, n_cols):
+	x_dot = np.zeros(n_cols, dtype='float64')
+	y_dot = np.zeros(n_cols, dtype='float64')
+
+	if X_row.nnz > 0:
+		x_dot[X_row.indices] = X_row.data
+
+	if Y_row.nnz > 0:
+		y_dot[Y_row.indices] = Y_row.data
+
+	return np.maximum(x_dot, y_dot)
+
+def _sparse_mm_dot_scipy(X, Y, k, block_size=32):
+	n_rows = X.shape[0]
+
+	neighbors = np.empty((n_rows, k), dtype='int32')
+	sims = np.empty((n_rows, k), dtype='float64')
+
+	for start in range(0, n_rows, block_size):
+		end = min(start + block_size, n_rows)
+		X_block = X[start:end]
+		fwd = X_block @ X.T
+		rev = X_block @ Y.T
+
+		for block_i, i in enumerate(range(start, end)):
+			dot = _merge_sparse_rows_to_dense(
+				fwd.getrow(block_i), rev.getrow(block_i), n_rows)
+			dot_argsort = _topk_stable(dot, k)
+			neighbors[i] = dot_argsort.astype('int32')
+			sims[i] = dot[dot_argsort]
+
+	return sims, neighbors
+
+def _build_inverted_index(X):
+	row_counts = np.diff(X.indptr)
+	rows = np.repeat(np.arange(X.shape[0], dtype='int64'), row_counts)
+	keys = X.indices.astype('int64', copy=False)
+	data = X.data.astype('float64', copy=False)
+
+	order = np.argsort(keys, kind='mergesort')
+	sorted_keys = keys[order]
+	sorted_rows = rows[order]
+	sorted_data = data[order]
+
+	unique_keys, starts = np.unique(sorted_keys, return_index=True)
+	ends = np.empty_like(starts)
+	ends[:-1] = starts[1:]
+	ends[-1] = len(sorted_keys)
+
+	return unique_keys, starts.astype('int64'), ends.astype('int64'), sorted_rows, sorted_data
+
+@njit
+def _find_key_idx(keys, key):
+	left = 0
+	right = len(keys)
+
+	while left < right:
+		mid = (left + right) // 2
+		if keys[mid] < key:
+			left = mid + 1
+		else:
+			right = mid
+
+	if left < len(keys) and keys[left] == key:
+		return left
+
+	return -1
+
+@njit
+def _sparse_mm_dot_inverted(X_data, X_indices, X_indptr,
+	X_keys, X_starts, X_ends, X_rows, X_values,
+	Y_keys, Y_starts, Y_ends, Y_rows, Y_values, k):
+
+	n_rows = len(X_indptr) - 1
+
+	neighbors = np.empty((n_rows, k), dtype='int32')
+	sims = np.empty((n_rows, k), dtype='float64')
+
+	xdot = np.zeros(n_rows, dtype='float64')
+	ydot = np.zeros(n_rows, dtype='float64')
+	x_seen = np.zeros(n_rows, dtype='int64')
+	y_seen = np.zeros(n_rows, dtype='int64')
+
+	pos_idxs = np.empty(n_rows, dtype='int32')
+	pos_scores = np.empty(n_rows, dtype='float64')
+	neg_idxs = np.empty(n_rows, dtype='int32')
+	neg_scores = np.empty(n_rows, dtype='float64')
+
+	for i in range(n_rows):
+		epoch = i + 1
+
+		for row_idx in range(X_indptr[i], X_indptr[i+1]):
+			col = X_indices[row_idx]
+			value = X_data[row_idx]
+
+			x_key_idx = _find_key_idx(X_keys, col)
+			if x_key_idx != -1:
+				for idx in range(X_starts[x_key_idx], X_ends[x_key_idx]):
+					row = X_rows[idx]
+					if x_seen[row] != epoch:
+						x_seen[row] = epoch
+						xdot[row] = 0.0
+
+					xdot[row] += value * X_values[idx]
+
+			y_key_idx = _find_key_idx(Y_keys, col)
+			if y_key_idx != -1:
+				for idx in range(Y_starts[y_key_idx], Y_ends[y_key_idx]):
+					row = Y_rows[idx]
+					if y_seen[row] != epoch:
+						y_seen[row] = epoch
+						ydot[row] = 0.0
+
+					ydot[row] += value * Y_values[idx]
+
+		n_pos = 0
+		n_neg = 0
+		for row in range(n_rows):
+			x_score = 0.0
+			y_score = 0.0
+			if x_seen[row] == epoch:
+				x_score = xdot[row]
+			if y_seen[row] == epoch:
+				y_score = ydot[row]
+
+			score = max(x_score, y_score)
+			if score > 0.0:
+				pos_idxs[n_pos] = row
+				pos_scores[n_pos] = score
+				n_pos += 1
+			elif score < 0.0:
+				neg_idxs[n_neg] = row
+				neg_scores[n_neg] = score
+				n_neg += 1
+
+		result_count = 0
+
+		pos_order = np.argsort(-pos_scores[:n_pos], kind='mergesort')
+		for order_idx in range(len(pos_order)):
+			if result_count == k:
+				break
+
+			pos_idx = pos_order[order_idx]
+			row = pos_idxs[pos_idx]
+			neighbors[i, result_count] = row
+			sims[i, result_count] = pos_scores[pos_idx]
+			result_count += 1
+
+		if result_count < k:
+			for row in range(n_rows):
+				x_score = 0.0
+				y_score = 0.0
+				if x_seen[row] == epoch:
+					x_score = xdot[row]
+				if y_seen[row] == epoch:
+					y_score = ydot[row]
+
+				if max(x_score, y_score) == 0.0:
+					neighbors[i, result_count] = row
+					sims[i, result_count] = 0.0
+					result_count += 1
+					if result_count == k:
+						break
+
+		if result_count < k:
+			neg_order = np.argsort(-neg_scores[:n_neg], kind='mergesort')
+			for order_idx in range(len(neg_order)):
+				if result_count == k:
+					break
+
+				neg_idx = neg_order[order_idx]
+				row = neg_idxs[neg_idx]
+				neighbors[i, result_count] = row
+				sims[i, result_count] = neg_scores[neg_idx]
+				result_count += 1
+
+	return sims, neighbors
+
 def cosine_similarity_from_seqlets(seqlets, n_neighbors, sign, topn=20, 
 	min_k=4, max_k=6, max_gap=15, max_len=15, max_entries=500, 
-	alphabet_size=4):
+	alphabet_size=4, backend='auto'):
 
 	X_fwd = gapped_kmer._seqlet_to_gkmers(seqlets, topn, 
 		min_k, max_k, max_gap, max_len, max_entries, True, sign)
@@ -79,11 +309,26 @@ def cosine_similarity_from_seqlets(seqlets, n_neighbors, sign, topn=20,
 
 	n, d = X.shape
 	k = min(n_neighbors+1, n)
-	return _sparse_mm_dot(X.data, X.indices, X.indptr, Y.data, Y.indices, Y.indptr, k)
+	if backend == 'auto':
+		backend = 'inverted'
+
+	if backend == 'numba':
+		return _sparse_mm_dot(
+			X.data, X.indices.astype('int64'), X.indptr.astype('int64'),
+			Y.data, Y.indices.astype('int64'), Y.indptr.astype('int64'), k)
+	elif backend == 'inverted':
+		X_keys, X_starts, X_ends, X_rows, X_values = _build_inverted_index(X)
+		Y_keys, Y_starts, Y_ends, Y_rows, Y_values = _build_inverted_index(Y)
+		return _sparse_mm_dot_inverted(
+			X.data, X.indices.astype('int64'), X.indptr.astype('int64'),
+			X_keys, X_starts, X_ends, X_rows, X_values,
+			Y_keys, Y_starts, Y_ends, Y_rows, Y_values, k)
+	else:
+		raise ValueError("Unrecognized backend: {}".format(backend))
 
 
 def jaccard_from_seqlets(seqlets, min_overlap, filter_seqlets=None, 
-	seqlet_neighbors=None):
+	seqlet_neighbors=None, sparse_backend='max_only'):
 
 	all_fwd_data, all_rev_data = util.get_2d_data_from_patterns(seqlets)
 
@@ -102,19 +347,19 @@ def jaccard_from_seqlets(seqlets, min_overlap, filter_seqlets=None,
 	affmat_fwd = jaccard(seqlet_neighbors=seqlet_neighbors, 
 		X=filters_all_fwd_data,
 		Y=all_fwd_data, min_overlap=min_overlap, func=int, 
-		return_sparse=True)
+		return_sparse=True, sparse_backend=sparse_backend)
 
 	affmat_rev = jaccard(seqlet_neighbors=seqlet_neighbors,
 		X=filters_all_rev_data, Y=all_fwd_data,
 		min_overlap=min_overlap, func=int,
-		return_sparse=True) 
+		return_sparse=True, sparse_backend=sparse_backend) 
 
 	affmat = np.maximum(affmat_fwd, affmat_rev)
 	return affmat
 
 
 def jaccard(X, Y, min_overlap=None, seqlet_neighbors=None, func=np.ceil, 
-	return_sparse=False):
+	return_sparse=False, sparse_backend='max_only'):
 
 	if seqlet_neighbors is None:
 		seqlet_neighbors = np.tile(np.arange(X.shape[0]), (Y.shape[0], 1))
@@ -132,6 +377,14 @@ def jaccard(X, Y, min_overlap=None, seqlet_neighbors=None, func=np.ceil,
 	Y = Y.astype('float32')
 
 	seqlet_neighbors = seqlet_neighbors.astype('int32')
+
+	if return_sparse == True and sparse_backend == 'max_only':
+		scores = np.zeros((Y.shape[0], seqlet_neighbors.shape[1]), dtype='float32')
+		_jaccard_max_only(X, Y, seqlet_neighbors, scores)
+		return scores
+	elif sparse_backend != 'max_only' and sparse_backend != 'tensor':
+		raise ValueError("Unrecognized sparse_backend: {}".format(sparse_backend))
+
 	scores = np.zeros((Y.shape[0], seqlet_neighbors.shape[1], len_output), dtype='float32')
 	_jaccard(X, Y, seqlet_neighbors, scores)
 
@@ -215,6 +468,50 @@ def _jaccard(X, Y, neighbors, scores):
 				scores[l, i, idx] = min_sum / max_sum
 
 
+@njit('void(float32[:, :, :], float32[:, :, :], int32[:, :], float32[:, :])', parallel=True)
+def _jaccard_max_only(X, Y, neighbors, scores):
+	nx, d, m = X.shape
+	ny = Y.shape[0]
+	len_output = 1 + Y.shape[1] - X.shape[1]
+
+	for l in prange(ny):
+		for i in range(neighbors.shape[1]):
+			best_score = -np.inf
+			has_nan = False
+			neighbor_li = neighbors[l, i]
+
+			for idx in range(len_output):
+				min_sum = 0.0
+				max_sum = 0.0
+
+				for j in range(idx, idx+d):
+					j_idx = j - idx
+
+					for k in range(m):
+						sign = np.sign(X[neighbor_li, j_idx, k]) * np.sign(Y[l, j, k])
+
+						x = abs(X[neighbor_li, j_idx, k])
+						y = abs(Y[l, j, k])
+
+						if y > x:
+							min_sum += x * sign
+							max_sum += y
+						else:
+							min_sum += y * sign
+							max_sum += x
+
+				score = min_sum / max_sum
+				if np.isnan(score):
+					has_nan = True
+				elif score > best_score:
+					best_score = score
+
+			if has_nan:
+				scores[l, i] = np.nan
+			else:
+				scores[l, i] = best_score
+
+
 
 def pearson_correlation(X, Y, min_overlap=None, func=np.ceil):
 	if X.ndim == 2:
@@ -292,4 +589,3 @@ class NNTsneConditionalProbs():
 		P = coo_matrix((data, (rows, cols)),
 					   shape=(len(neighbors), len(neighbors)))
 		return P
-
