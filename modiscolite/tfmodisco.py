@@ -90,15 +90,22 @@ def _csr_apply_density_adaptation(data, indices, indptr, betas, normfactors):
 def _density_adaptation_optimized(affmat_nn, seqlet_neighbors, tsne_perplexity):
 	eps = 0.0000001
 
-	affmat_nn = np.asarray(affmat_nn, dtype='float64')
-	seqlet_neighbors = np.asarray(seqlet_neighbors)
+	# affmat_nn/seqlet_neighbors are rectangular (fixed k per row) coming
+	# straight out of cosine_similarity_from_seqlets/jaccard_from_seqlets,
+	# but ragged (variable neighbors per row) after _filter_by_correlation
+	# has pruned per-row neighbor lists down to surviving indices. Building
+	# the CSR triplet via per-row concatenation handles both cases, whereas
+	# np.asarray(...).reshape(-1) only works for the rectangular case.
+	n = len(affmat_nn)
+	row_lengths = np.fromiter((len(row) for row in affmat_nn), dtype='int64',
+		count=n)
+	rows = np.repeat(np.arange(n, dtype='int64'), row_lengths)
+	cols = np.concatenate([np.asarray(row, dtype='int64')
+		for row in seqlet_neighbors]) if n > 0 else np.empty(0, dtype='int64')
+	data = np.concatenate([np.asarray(row, dtype='float64')
+		for row in affmat_nn]) if n > 0 else np.empty(0, dtype='float64')
 
-	n, k = affmat_nn.shape
-	rows = np.repeat(np.arange(n, dtype='int64'), k)
-	cols = seqlet_neighbors.reshape(-1)
-	data = affmat_nn.reshape(-1)
-
-	affmat_nn = scipy.sparse.csr_matrix((data, (rows, cols)), 
+	affmat_nn = scipy.sparse.csr_matrix((data, (rows, cols)),
 		shape=(n, n), dtype='float64')
 	
 	affmat_nn.data = np.maximum(np.log((1.0/(0.5*np.maximum(affmat_nn.data, eps)))-1), 0)
