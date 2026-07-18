@@ -119,7 +119,7 @@ class SeqletSet():
 		self.subclusters = None
 		self.subcluster_to_subpattern = None
 
-	def compute_subpatterns(self, perplexity, n_seeds, n_iterations=-1, profile=False):
+	def compute_subpatterns(self, perplexity, n_seeds, n_iterations=-1, profile=False, n_jobs=1):
 		profiler = util.ensure_profile_recorder(profile)
 
 		#this method assumes all the seqlets have been expanded so they
@@ -156,7 +156,7 @@ class SeqletSet():
 		#Do Leiden clustering
 		with profiler.time("compute_subpatterns.leiden_cluster"):
 			self.subclusters = cluster.LeidenCluster(sp_density_adapted_affmat,
-				n_seeds=n_seeds, n_leiden_iterations=n_iterations) 
+				n_seeds=n_seeds, n_leiden_iterations=n_iterations, n_jobs=n_jobs)
 
 		#this method assumes all the seqlets have been expanded so they
 		# all start at 0

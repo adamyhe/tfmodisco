@@ -247,12 +247,12 @@ def seqlets_to_patterns(seqlets, track_set, track_signs=None,
 	final_min_cluster_size=20,min_ic_in_window=0.6, min_ic_windowsize=6,
 	ppm_pseudocount=0.001, profile=False,
 	coarse_affinity_backend='auto', fine_affinity_backend='max_only',
-	density_adaptation_backend='auto'):
+	density_adaptation_backend='auto', n_leiden_jobs=1):
 
 	print_profile_summary = bool(profile) and not isinstance(profile, util.ProfileRecorder)
 	profiler = util.ensure_profile_recorder(profile)
 
-	bg_freq = np.mean([seqlet.sequence for seqlet in seqlets], axis=(0, 1)) 
+	bg_freq = np.mean([seqlet.sequence for seqlet in seqlets], axis=(0, 1))
 
 	seqlets_sorter = (lambda arr: sorted(arr, key=lambda x:
 		-np.sum(np.abs(x.contrib_scores))))
@@ -304,7 +304,8 @@ def seqlets_to_patterns(seqlets, track_set, track_signs=None,
 			cluster_indices = cluster.LeidenCluster(
 				csr_density_adapted_affmat,
 				n_seeds=n_leiden_runs,
-				n_leiden_iterations=n_leiden_iterations)
+				n_leiden_iterations=n_leiden_iterations,
+				n_jobs=n_leiden_jobs)
 
 		del csr_density_adapted_affmat
 
@@ -337,7 +338,7 @@ def seqlets_to_patterns(seqlets, track_set, track_signs=None,
 			flank_to_add=initial_flank_to_add,
 			window_size=trim_to_window_size, bg_freq=bg_freq,
 			max_seqlets_subsample=merging_max_seqlets_subsample,
-			n_seeds=n_leiden_runs)
+			n_seeds=n_leiden_runs, n_leiden_jobs=n_leiden_jobs)
 
 	#Now start merging patterns 
 	merged_patterns = sorted(merged_patterns, key=lambda x: -len(x.seqlets))
@@ -354,9 +355,9 @@ def seqlets_to_patterns(seqlets, track_set, track_signs=None,
 			right_flank_to_add=final_flank_to_add)
 
 		with profiler.time("seqlets_to_patterns.final_compute_subpatterns"):
-			pattern.compute_subpatterns(subcluster_perplexity, 
+			pattern.compute_subpatterns(subcluster_perplexity,
 				n_seeds=n_leiden_runs, n_iterations=n_leiden_iterations,
-				profile=profiler)
+				profile=profiler, n_jobs=n_leiden_jobs)
 		
 		patterns[patternidx] = pattern
 
@@ -381,7 +382,7 @@ def TFMoDISco(one_hot, hypothetical_contribs, sliding_window_size=21,
 	final_min_cluster_size=20, min_ic_in_window=0.6, min_ic_windowsize=6,
 	ppm_pseudocount=0.001, verbose=False, profile=False,
 	coarse_affinity_backend='auto', fine_affinity_backend='max_only',
-	density_adaptation_backend='auto'):
+	density_adaptation_backend='auto', n_leiden_jobs=1):
 
 	print_profile_summary = bool(profile) and not isinstance(profile, util.ProfileRecorder)
 	profiler = util.ensure_profile_recorder(profile)
@@ -448,7 +449,8 @@ def TFMoDISco(one_hot, hypothetical_contribs, sliding_window_size=21,
 				profile=profiler,
 				coarse_affinity_backend=coarse_affinity_backend,
 				fine_affinity_backend=fine_affinity_backend,
-				density_adaptation_backend=density_adaptation_backend)
+				density_adaptation_backend=density_adaptation_backend,
+				n_leiden_jobs=n_leiden_jobs)
 	else:
 		pos_patterns = None
 
@@ -483,7 +485,8 @@ def TFMoDISco(one_hot, hypothetical_contribs, sliding_window_size=21,
 				profile=profiler,
 				coarse_affinity_backend=coarse_affinity_backend,
 				fine_affinity_backend=fine_affinity_backend,
-				density_adaptation_backend=density_adaptation_backend)
+				density_adaptation_backend=density_adaptation_backend,
+				n_leiden_jobs=n_leiden_jobs)
 	else:
 		neg_patterns = None
 

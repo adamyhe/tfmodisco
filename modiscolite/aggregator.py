@@ -173,12 +173,13 @@ def _detect_spurious_merging(patterns, track_set, perplexity,
 	min_in_subcluster, min_overlap, prob_and_pertrack_sim_merge_thresholds,
 	prob_and_pertrack_sim_dealbreaker_thresholds,
 	min_frac, min_num, flank_to_add, window_size, bg_freq,
-	n_seeds, max_seqlets_subsample=1000):
+	n_seeds, max_seqlets_subsample=1000, n_leiden_jobs=1):
 
 	to_return = []
 	for i, pattern in enumerate(patterns):
 		if len(pattern.seqlets) > min_in_subcluster:
-			pattern.compute_subpatterns(perplexity=perplexity, n_seeds=n_seeds)
+			pattern.compute_subpatterns(perplexity=perplexity, n_seeds=n_seeds,
+				n_jobs=n_leiden_jobs)
 
 			subpatterns = pattern.subcluster_to_subpattern.values()
 			refined_subpatterns = SimilarPatternsCollapser(patterns=subpatterns, 
