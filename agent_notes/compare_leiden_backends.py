@@ -284,6 +284,82 @@ def make_cugraph_leiden_cluster():
     return _leiden_cluster, seed_param
 
 
+def compare_pattern_sets(patterns_a, patterns_b, label_a="leidenalg", label_b="cugraph",
+        sig_threshold=0.05):
+    """Cross-compare two sets of discovered patterns with TOMTOM (via
+    memelite, in-process -- no external tomtom binary needed), to answer
+    the question graph-level ARI/modularity can't: are patterns unique to
+    one set genuinely novel/different motifs, or redundant splits/merges
+    of a motif the other set already found as one pattern?
+
+    Uses each pattern's contribution-weight matrix (contrib_scores), the
+    same representation this codebase's own report.py/descriptive_report.py
+    use for TOMTOM-based comparison against reference motif databases --
+    here the "database" is just the other backend's pattern set instead of
+    an external motif database.
+    """
+    from memelite import tomtom
+
+    if not patterns_a or not patterns_b:
+        return "  (one of the pattern sets is empty -- nothing to compare)"
+
+    Qs = [p.contrib_scores.T.astype('float64') for p in patterns_b]
+    Ts = [p.contrib_scores.T.astype('float64') for p in patterns_a]
+
+    best_p_values = tomtom(Qs, Ts, n_jobs=-1)[0]
+
+    lines = []
+    lines.append(f"  TOMTOM cross-comparison: {label_b} (query, n={len(Qs)}) vs "
+        f"{label_a} (target, n={len(Ts)}), significance threshold p<{sig_threshold}")
+
+    unmatched_b = []
+    best_target_for = {}
+    for qi in range(len(Qs)):
+        row = best_p_values[qi]
+        best_ti = int(np.argmin(row))
+        best_p = row[best_ti]
+        best_target_for[qi] = best_ti
+        flag = "" if best_p < sig_threshold else "  <-- NO significant match"
+        lines.append(f"    {label_b}[{qi}] (n_seqlets={len(patterns_b[qi].seqlets)}) best match: "
+            f"{label_a}[{best_ti}] (n_seqlets={len(patterns_a[best_ti].seqlets)}) "
+            f"p={best_p:.2e}{flag}")
+        if best_p >= sig_threshold:
+            unmatched_b.append(qi)
+
+    unmatched_a = [ti for ti in range(len(Ts)) if np.min(best_p_values[:, ti]) >= sig_threshold]
+
+    lines.append("")
+    if unmatched_b:
+        lines.append(f"  {label_b} patterns with NO significant match in {label_a}: {unmatched_b}")
+        lines.append(f"  -- candidates for motifs genuinely novel to {label_b}, or spurious splits.")
+    else:
+        lines.append(f"  Every {label_b} pattern has a significant match in {label_a}.")
+
+    if unmatched_a:
+        lines.append(f"  {label_a} patterns with NO significant match in {label_b}: {unmatched_a}")
+        lines.append(f"  -- candidates for motifs {label_b} missed or merged into something else.")
+    else:
+        lines.append(f"  Every {label_a} pattern has a significant match in {label_b}.")
+
+    from collections import defaultdict
+    target_to_queries = defaultdict(list)
+    for qi, ti in best_target_for.items():
+        if best_p_values[qi, ti] < sig_threshold:
+            target_to_queries[ti].append(qi)
+
+    split_candidates = {ti: qis for ti, qis in target_to_queries.items() if len(qis) > 1}
+    if split_candidates:
+        lines.append("")
+        lines.append(f"  Possible splits -- multiple {label_b} patterns both best-matching the")
+        lines.append(f"  same {label_a} pattern (that {label_a} pattern may have been split by "
+            f"{label_b}):")
+        for ti, qis in split_candidates.items():
+            lines.append(f"    {label_a}[{ti}] (n_seqlets={len(patterns_a[ti].seqlets)}) "
+                f"<- {label_b}{qis}")
+
+    return "\n".join(lines)
+
+
 def run_full_pipeline_comparison(data_dir, n_peaks, window, max_seqlets_per_metacluster,
         n_leiden_runs, seed):
     from modiscolite import cluster, tfmodisco, util
@@ -305,6 +381,8 @@ def run_full_pipeline_comparison(data_dir, n_peaks, window, max_seqlets_per_meta
             "n_neg": len(neg) if neg else 0,
             "pos_sizes": sorted((len(p.seqlets) for p in pos), reverse=True) if pos else [],
             "neg_sizes": sorted((len(p.seqlets) for p in neg), reverse=True) if neg else [],
+            "patterns_pos": pos or [],
+            "profile_summary": profiler.summary(),
         }
 
     print("  [pipeline] running leidenalg (CPU) end to end -- this is the slow part ...")
@@ -313,7 +391,8 @@ def run_full_pipeline_comparison(data_dir, n_peaks, window, max_seqlets_per_meta
     try:
         cugraph_leiden_cluster, seed_param = make_cugraph_leiden_cluster()
     except ImportError as e:
-        return {"cpu": cpu_result, "gpu": None, "gpu_error": str(e), "seed_param": None}
+        return {"cpu": cpu_result, "gpu": None, "gpu_error": str(e), "seed_param": None,
+            "tomtom_comparison": None}
 
     original_leiden_cluster = cluster.LeidenCluster
     cluster.LeidenCluster = cugraph_leiden_cluster
@@ -323,7 +402,12 @@ def run_full_pipeline_comparison(data_dir, n_peaks, window, max_seqlets_per_meta
     finally:
         cluster.LeidenCluster = original_leiden_cluster
 
-    return {"cpu": cpu_result, "gpu": gpu_result, "gpu_error": None, "seed_param": seed_param}
+    print("  [pipeline] cross-comparing resulting patterns with TOMTOM ...")
+    tomtom_comparison = compare_pattern_sets(cpu_result["patterns_pos"], gpu_result["patterns_pos"],
+        label_a="leidenalg", label_b="cugraph")
+
+    return {"cpu": cpu_result, "gpu": gpu_result, "gpu_error": None, "seed_param": seed_param,
+        "tomtom_comparison": tomtom_comparison}
 
 
 def summarize(leidenalg_results, cugraph_results, cugraph_error, cugraph_seed_param):
@@ -395,6 +479,13 @@ def summarize(leidenalg_results, cugraph_results, cugraph_error, cugraph_seed_pa
     return "\n".join(lines)
 
 
+def _format_profile_summary(profile_summary, indent="    "):
+    lines = []
+    for stage, stats in sorted(profile_summary.items(), key=lambda kv: -kv[1]["seconds"]):
+        lines.append(f"{indent}{stage}: {stats['seconds']:.4f}s over {stats['count']} call(s)")
+    return lines
+
+
 def summarize_pipeline_comparison(result):
     lines = []
     lines.append("")
@@ -403,6 +494,8 @@ def summarize_pipeline_comparison(result):
     lines.append(f"  leidenalg: wall={cpu['wall_seconds']:.2f}s n_pos={cpu['n_pos']} "
         f"n_neg={cpu['n_neg']}")
     lines.append(f"    pos_pattern_sizes={cpu['pos_sizes']}")
+    lines.append("  leidenalg per-stage breakdown (sorted by cost):")
+    lines.extend(_format_profile_summary(cpu["profile_summary"]))
 
     if result["gpu"] is None:
         lines.append(f"  cuGraph: SKIPPED -- {result['gpu_error']}")
@@ -414,7 +507,13 @@ def summarize_pipeline_comparison(result):
     lines.append(f"  cuGraph:   wall={gpu['wall_seconds']:.2f}s n_pos={gpu['n_pos']} "
         f"n_neg={gpu['n_neg']}")
     lines.append(f"    pos_pattern_sizes={gpu['pos_sizes']}")
+    lines.append("  cuGraph per-stage breakdown (sorted by cost):")
+    lines.extend(_format_profile_summary(gpu["profile_summary"]))
     lines.append(f"  full-pipeline speedup: {cpu['wall_seconds'] / gpu['wall_seconds']:.2f}x")
+    lines.append("  (compare the two breakdowns above to see how much of the gap between this")
+    lines.append("  number and the graph-level speedup is fixed non-Leiden cost -- e.g. coarse/")
+    lines.append("  fine affinity, which don't change between backends -- versus cuGraph-side")
+    lines.append("  overhead like rebuilding a cuDF graph for every subclustering call.)")
 
     counts_match = cpu['n_pos'] == gpu['n_pos'] and cpu['n_neg'] == gpu['n_neg']
     lines.append(f"  pattern count match: {'YES' if counts_match else 'NO -- investigate before trusting'}")
@@ -423,8 +522,11 @@ def summarize_pipeline_comparison(result):
         lines.append("  strong (though not conclusive) sign the substitution is behaving well.")
     elif counts_match:
         lines.append("  pattern counts match but per-pattern sizes differ -- same NUMBER of")
-        lines.append("  patterns found, but not necessarily the same patterns. Worth comparing")
-        lines.append("  actual pattern content (e.g. via a report or PWM diff) before trusting this.")
+        lines.append("  patterns found, but not necessarily the same patterns.")
+
+    if result.get("tomtom_comparison"):
+        lines.append("")
+        lines.append(result["tomtom_comparison"])
 
     return "\n".join(lines)
 
