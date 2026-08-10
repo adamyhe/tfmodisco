@@ -15,6 +15,18 @@ limits -- IF its output is close enough to leidenalg's to trust, and IF
 it's actually faster on graphs this size/shape (up to ~20k vertices,
 ~10M edges here).
 
+ALSO COMPARED (2026-07-19, local): igraph itself has a native C Leiden
+implementation (`Graph.community_leiden`), separate from the `leidenalg`
+package this pipeline currently uses. On a real captured graph it was
+~17-20x faster per call than leidenalg, comparable-or-better quality, AND
+(unlike cugraph.leiden) responded to seed variation with genuinely different
+partitions (ARI=0.46 between two seeds, vs. cugraph's 1.0). It does not
+release the GIL either, so process-based parallelism is still needed for
+concurrent seed exploration -- this is a per-call speed + diversity win, not
+a new parallelism model. See make_igraph_native_leiden_cluster below. This
+is a much lower-risk candidate than either cuGraph or a from-scratch
+implementation: no new dependency, no CUDA, already installed.
+
 RESULTS SO FAR (2026-07-18, real L40S run, 5000 peaks / 20000 max seqlets):
 a single cugraph.leiden call is ~85x faster than a single leidenalg call
 (0.18s vs 15.2s) and lands in the SAME dominant local optimum most
@@ -181,10 +193,7 @@ def _detect_cugraph_seed_param(leiden_fn):
     return None, accepted
 
 
-def _build_cugraph_graph(affmat):
-    import cudf
-    import cugraph
-
+def _affmat_edges(affmat):
     n_vertices = affmat.shape[0]
     n_cols = affmat.indptr
     sources = np.concatenate([np.ones(n_cols[i+1] - n_cols[i], dtype='int32') * i
@@ -193,12 +202,44 @@ def _build_cugraph_graph(affmat):
     # caveat in the module docstring.
     targets = affmat.indices.astype('int32')
     weights = affmat.data.astype('float64')
+    return n_vertices, sources, targets, weights
+
+
+def _perturb_weights(weights, jitter_scale, seed):
+    """Seeded multiplicative jitter on edge weights.
+
+    Varying cugraph.leiden's random_state/seed parameter alone was shown
+    (2026-07-18/19 runs) to produce bit-identical output on a fixed graph --
+    so it's not a source of real diversity here. Perturbing the input
+    graph itself is the other lever available to test whether cugraph's
+    local optimum is sensitive to the exact input at all, which is a
+    prerequisite for any best-of-N or consensus ensembling to have
+    anything real to ensemble over.
+    """
+    if jitter_scale <= 0:
+        return weights
+    rng = np.random.RandomState(seed)
+    noise = rng.standard_normal(len(weights)) * jitter_scale
+    perturbed = weights * (1.0 + noise)
+    # Keep weights positive -- a sign flip changes the graph's semantics,
+    # not just perturbs it.
+    return np.clip(perturbed, 1e-12, None)
+
+
+def _build_cugraph_graph_from_edges(n_vertices, sources, targets, weights):
+    import cudf
+    import cugraph
 
     edgelist = cudf.DataFrame({"src": sources, "dst": targets, "weight": weights})
     G = cugraph.Graph(directed=False)
     G.from_cudf_edgelist(edgelist, source="src", destination="dst",
         edge_attr="weight", renumber=True)
     return G
+
+
+def _build_cugraph_graph(affmat):
+    n_vertices, sources, targets, weights = _affmat_edges(affmat)
+    return _build_cugraph_graph_from_edges(n_vertices, sources, targets, weights)
 
 
 def _cugraph_leiden_call(G, seed_param, accepted, seed_value):
@@ -229,28 +270,56 @@ def _cugraph_leiden_call(G, seed_param, accepted, seed_value):
     return float(modularity), membership
 
 
-def run_cugraph_leiden(affmat, n_trials=3):
+def run_cugraph_leiden(affmat, n_trials=3, jitter_scale=0.05):
+    """Runs BOTH repeat modes as a diagnostic, on the same captured graph:
+
+    - 'seed': graph built once, vary only the random_state/seed parameter
+      across trials. Cheap, but per the 2026-07-18/19 runs this gave
+      bit-identical results every time -- i.e. no diversity.
+    - 'perturbation': rebuild the graph with a small seeded multiplicative
+      jitter on edge weights for every trial. Tests whether cugraph's
+      local optimum is sensitive to the exact input at all.
+
+    If perturbation-mode trial-to-trial ARI is ALSO ~1.0, this graph likely
+    has one dominant modularity basin for cugraph's algorithm, and neither
+    best-of-N nor consensus ensembling would have anything real to work
+    with. If it's meaningfully lower (but not near 0), there IS real
+    diversity to build an ensemble on.
+    """
     try:
         import cugraph
     except ImportError as e:
         return None, str(e), None
 
-    G = _build_cugraph_graph(affmat)
+    n_vertices, sources, targets, weights = _affmat_edges(affmat)
     seed_param, accepted = _detect_cugraph_seed_param(cugraph.leiden)
 
-    results = []
+    seed_mode_results = []
+    G = _build_cugraph_graph_from_edges(n_vertices, sources, targets, weights)
     for trial in range(n_trials):
         seed_value = (trial + 1) * 100
         start = time.perf_counter()
         quality, membership = _cugraph_leiden_call(G, seed_param, accepted, seed_value)
         wall = time.perf_counter() - start
-        results.append({"trial": trial, "quality": quality, "membership": membership,
-            "wall_seconds": wall})
+        seed_mode_results.append({"trial": trial, "quality": quality,
+            "membership": membership, "wall_seconds": wall})
 
-    return results, None, seed_param
+    perturbation_mode_results = []
+    for trial in range(n_trials):
+        seed_value = (trial + 1) * 100
+        perturbed_weights = _perturb_weights(weights, jitter_scale, seed_value)
+        G_perturbed = _build_cugraph_graph_from_edges(n_vertices, sources, targets,
+            perturbed_weights)
+        start = time.perf_counter()
+        quality, membership = _cugraph_leiden_call(G_perturbed, seed_param, accepted, seed_value)
+        wall = time.perf_counter() - start
+        perturbation_mode_results.append({"trial": trial, "quality": quality,
+            "membership": membership, "wall_seconds": wall})
+
+    return {"seed": seed_mode_results, "perturbation": perturbation_mode_results}, None, seed_param
 
 
-def make_cugraph_leiden_cluster():
+def make_cugraph_leiden_cluster(repeat_mode="seed", jitter_scale=0.05):
     """A drop-in replacement for cluster.LeidenCluster backed by
     cugraph.leiden, for monkeypatching into a full pipeline run.
 
@@ -259,21 +328,43 @@ def make_cugraph_leiden_cluster():
     semantics as the real LeidenCluster, so no calling code needs to
     change -- n_leiden_iterations and n_jobs are accepted but unused (GPU
     calls are already fast and run on a single device, not a CPU process
-    pool). Builds the cugraph Graph once and reuses it across the n_seeds
-    candidate calls, mirroring how the real LeidenCluster reuses one
-    igraph.Graph across its seed loop.
+    pool).
+
+    repeat_mode='seed': builds the graph once and reuses it across the
+    n_seeds candidate trials, only varying the random_state/seed param.
+    Cheap (one graph build per LeidenCluster call), but per the graph-level
+    diagnostic in run_cugraph_leiden this may give zero diversity if the
+    graph has one dominant modularity basin for cugraph's algorithm.
+
+    repeat_mode='perturbation': rebuilds the graph with a small seeded
+    multiplicative jitter on edge weights for EVERY trial. More expensive
+    (one cuDF/graph-construction cost per trial, not amortized), but is
+    the only lever confirmed to sometimes vary cugraph's result.
     """
     import cugraph
+
+    if repeat_mode not in ("seed", "perturbation"):
+        raise ValueError(f"Unrecognized repeat_mode: {repeat_mode!r}")
 
     seed_param, accepted = _detect_cugraph_seed_param(cugraph.leiden)
 
     def _leiden_cluster(affinity_mat, n_seeds=2, n_leiden_iterations=-1, n_jobs=1):
-        G = _build_cugraph_graph(affinity_mat)
+        n_vertices, sources, targets, weights = _affmat_edges(affinity_mat)
+
+        G = None
+        if repeat_mode == "seed":
+            G = _build_cugraph_graph_from_edges(n_vertices, sources, targets, weights)
 
         best_membership = None
         best_quality = None
         for trial in range(max(n_seeds, 1)):
             seed_value = (trial + 1) * 100
+
+            if repeat_mode == "perturbation":
+                perturbed_weights = _perturb_weights(weights, jitter_scale, seed_value)
+                G = _build_cugraph_graph_from_edges(n_vertices, sources, targets,
+                    perturbed_weights)
+
             quality, membership = _cugraph_leiden_call(G, seed_param, accepted, seed_value)
             if best_quality is None or quality > best_quality:
                 best_quality = quality
@@ -282,6 +373,115 @@ def make_cugraph_leiden_cluster():
         return best_membership
 
     return _leiden_cluster, seed_param
+
+
+# --- igraph-native helpers. igraph itself has a native C Leiden
+# implementation (Graph.community_leiden), separate from the leidenalg
+# package this pipeline currently uses. Confirmed 2026-07-19 on a real
+# captured graph: ~17-20x faster per call than leidenalg, comparable or
+# better quality, and -- unlike cugraph.leiden's random_state -- varying
+# the seed produces genuinely different partitions (ARI=0.46 between two
+# seeds on the same graph, vs. cugraph's 1.0). It does NOT release the GIL
+# though (checked the same way as leidenalg: ~1.0x "speedup" with 8
+# threads), so process-based parallelism is still needed for concurrent
+# seed exploration -- this is a per-call speed + diversity win, not a
+# parallelism-model change. No try/except ImportError needed: igraph is
+# already a hard dependency of modiscolite itself. ---
+
+def _build_igraph_graph_from_edges(n_vertices, sources, targets):
+    import igraph as ig
+
+    g = ig.Graph(directed=None)
+    g.add_vertices(n_vertices)
+    g.add_edges(zip(sources, targets))
+    return g
+
+
+def _igraph_native_leiden_call(g, weights, seed_value, n_leiden_iterations=-1):
+    import random
+
+    # community_leiden has no per-call seed kwarg -- it delegates to
+    # Python's global `random` module by default (confirmed: it responds
+    # to random.seed() with genuinely different partitions).
+    random.seed(seed_value)
+    vc = g.community_leiden(objective_function='modularity', weights=weights,
+        n_iterations=n_leiden_iterations)
+    return float(vc.quality), np.asarray(vc.membership)
+
+
+def run_igraph_native_leiden(affmat, n_trials=3, jitter_scale=0.05):
+    """Mirrors run_cugraph_leiden's structure exactly, for igraph's native
+    community_leiden instead of cugraph.leiden -- runs BOTH repeat modes as
+    a diagnostic on the same captured graph. See the module-level comment
+    above this section for the 2026-07-19 findings this is based on.
+    """
+    n_vertices, sources, targets, weights = _affmat_edges(affmat)
+
+    seed_mode_results = []
+    g = _build_igraph_graph_from_edges(n_vertices, sources, targets)
+    for trial in range(n_trials):
+        seed_value = (trial + 1) * 100
+        start = time.perf_counter()
+        quality, membership = _igraph_native_leiden_call(g, weights, seed_value)
+        wall = time.perf_counter() - start
+        seed_mode_results.append({"trial": trial, "quality": quality,
+            "membership": membership, "wall_seconds": wall})
+
+    perturbation_mode_results = []
+    for trial in range(n_trials):
+        seed_value = (trial + 1) * 100
+        perturbed_weights = _perturb_weights(weights, jitter_scale, seed_value)
+        g_perturbed = _build_igraph_graph_from_edges(n_vertices, sources, targets)
+        start = time.perf_counter()
+        quality, membership = _igraph_native_leiden_call(g_perturbed, perturbed_weights,
+            seed_value)
+        wall = time.perf_counter() - start
+        perturbation_mode_results.append({"trial": trial, "quality": quality,
+            "membership": membership, "wall_seconds": wall})
+
+    return {"seed": seed_mode_results, "perturbation": perturbation_mode_results}, None
+
+
+def make_igraph_native_leiden_cluster(repeat_mode="seed", jitter_scale=0.05):
+    """A drop-in replacement for cluster.LeidenCluster backed by igraph's
+    own native community_leiden. Mirrors make_cugraph_leiden_cluster's
+    structure; see run_igraph_native_leiden's docstring for the findings
+    behind this.
+
+    repeat_mode='seed': builds the graph once and reuses it across the
+    n_seeds candidate trials, reseeding Python's global random module
+    before each call. repeat_mode='perturbation': rebuilds the graph with a
+    small seeded multiplicative jitter on edge weights for EVERY trial.
+    """
+    if repeat_mode not in ("seed", "perturbation"):
+        raise ValueError(f"Unrecognized repeat_mode: {repeat_mode!r}")
+
+    def _leiden_cluster(affinity_mat, n_seeds=2, n_leiden_iterations=-1, n_jobs=1):
+        n_vertices, sources, targets, weights = _affmat_edges(affinity_mat)
+
+        g = None
+        if repeat_mode == "seed":
+            g = _build_igraph_graph_from_edges(n_vertices, sources, targets)
+
+        best_membership = None
+        best_quality = None
+        for trial in range(max(n_seeds, 1)):
+            seed_value = (trial + 1) * 100
+            trial_weights = weights
+
+            if repeat_mode == "perturbation":
+                trial_weights = _perturb_weights(weights, jitter_scale, seed_value)
+                g = _build_igraph_graph_from_edges(n_vertices, sources, targets)
+
+            quality, membership = _igraph_native_leiden_call(g, trial_weights,
+                seed_value, n_leiden_iterations=n_leiden_iterations)
+            if best_quality is None or quality > best_quality:
+                best_quality = quality
+                best_membership = membership
+
+        return best_membership
+
+    return _leiden_cluster
 
 
 def compare_pattern_sets(patterns_a, patterns_b, label_a="leidenalg", label_b="cugraph",
@@ -361,7 +561,8 @@ def compare_pattern_sets(patterns_a, patterns_b, label_a="leidenalg", label_b="c
 
 
 def run_full_pipeline_comparison(data_dir, n_peaks, window, max_seqlets_per_metacluster,
-        n_leiden_runs, seed):
+        n_leiden_runs, seed, cugraph_repeat_mode="seed", igraph_native_repeat_mode="seed",
+        jitter_scale=0.05):
     from modiscolite import cluster, tfmodisco, util
 
     seqs_path = Path(data_dir) / "seqs.npy"
@@ -388,30 +589,129 @@ def run_full_pipeline_comparison(data_dir, n_peaks, window, max_seqlets_per_meta
     print("  [pipeline] running leidenalg (CPU) end to end -- this is the slow part ...")
     cpu_result = _run(n_leiden_jobs=1)
 
+    result = {"cpu": cpu_result, "cugraph_repeat_mode": cugraph_repeat_mode,
+        "igraph_native_repeat_mode": igraph_native_repeat_mode}
+
     try:
-        cugraph_leiden_cluster, seed_param = make_cugraph_leiden_cluster()
+        cugraph_leiden_cluster, seed_param = make_cugraph_leiden_cluster(
+            repeat_mode=cugraph_repeat_mode, jitter_scale=jitter_scale)
+
+        original_leiden_cluster = cluster.LeidenCluster
+        cluster.LeidenCluster = cugraph_leiden_cluster
+        try:
+            print("  [pipeline] running cuGraph-substituted pipeline end to end ...")
+            gpu_result = _run(n_leiden_jobs=1)
+        finally:
+            cluster.LeidenCluster = original_leiden_cluster
+
+        print("  [pipeline] cross-comparing leidenalg vs cuGraph patterns with TOMTOM ...")
+        result["gpu"] = gpu_result
+        result["gpu_error"] = None
+        result["seed_param"] = seed_param
+        result["tomtom_comparison_cugraph"] = compare_pattern_sets(
+            cpu_result["patterns_pos"], gpu_result["patterns_pos"],
+            label_a="leidenalg", label_b="cugraph")
     except ImportError as e:
-        return {"cpu": cpu_result, "gpu": None, "gpu_error": str(e), "seed_param": None,
-            "tomtom_comparison": None}
+        result["gpu"] = None
+        result["gpu_error"] = str(e)
+        result["seed_param"] = None
+        result["tomtom_comparison_cugraph"] = None
+
+    igraph_native_leiden_cluster = make_igraph_native_leiden_cluster(
+        repeat_mode=igraph_native_repeat_mode, jitter_scale=jitter_scale)
 
     original_leiden_cluster = cluster.LeidenCluster
-    cluster.LeidenCluster = cugraph_leiden_cluster
+    cluster.LeidenCluster = igraph_native_leiden_cluster
     try:
-        print("  [pipeline] running cuGraph-substituted pipeline end to end ...")
-        gpu_result = _run(n_leiden_jobs=1)
+        print("  [pipeline] running igraph-native-substituted pipeline end to end ...")
+        igraph_native_result = _run(n_leiden_jobs=1)
     finally:
         cluster.LeidenCluster = original_leiden_cluster
 
-    print("  [pipeline] cross-comparing resulting patterns with TOMTOM ...")
-    tomtom_comparison = compare_pattern_sets(cpu_result["patterns_pos"], gpu_result["patterns_pos"],
-        label_a="leidenalg", label_b="cugraph")
+    print("  [pipeline] cross-comparing leidenalg vs igraph-native patterns with TOMTOM ...")
+    result["igraph_native"] = igraph_native_result
+    result["igraph_native_error"] = None
+    result["tomtom_comparison_igraph_native"] = compare_pattern_sets(
+        cpu_result["patterns_pos"], igraph_native_result["patterns_pos"],
+        label_a="leidenalg", label_b="igraph_native")
 
-    return {"cpu": cpu_result, "gpu": gpu_result, "gpu_error": None, "seed_param": seed_param,
-        "tomtom_comparison": tomtom_comparison}
+    return result
 
 
-def summarize(leidenalg_results, cugraph_results, cugraph_error, cugraph_seed_param):
+def _summarize_candidate_backend(backend_name, candidate_results, candidate_error,
+        leidenalg_results, best, seed_note=None, short_name=None):
+    """Reports one candidate backend's graph-level comparison against the
+    leidenalg baseline -- shared by cuGraph and igraph-native so the two
+    report identically-structured, directly comparable sections.
+    """
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+
+    lines = []
+    lines.append("")
+    lines.append(f"=== {backend_name} ===")
+    if candidate_results is None:
+        lines.append(f"  SKIPPED -- not available: {candidate_error}")
+        return "\n".join(lines)
+
+    if seed_note:
+        lines.append(f"  {seed_note}")
+
+    mode_labels = {
+        "seed": "seed (vary randomization only, same graph reused across trials)",
+        "perturbation": "perturbation (jitter edge weights, rebuild graph per trial)",
+    }
+    mode_mean_aris = {}
+    for mode_key, mode_label in mode_labels.items():
+        mode_results = candidate_results[mode_key]
+        lines.append("")
+        lines.append(f"  -- repeat mode: {mode_label} --")
+        for r in mode_results:
+            ari_vs_best = adjusted_rand_score(r["membership"], best["membership"])
+            nmi_vs_best = normalized_mutual_info_score(r["membership"], best["membership"])
+            lines.append(f"    trial={r['trial']}: quality={r['quality']:.6f} "
+                f"n_clusters={len(set(r['membership']))} wall={r['wall_seconds']:.3f}s "
+                f"ARI_vs_leidenalg_best={ari_vs_best:.4f} "
+                f"NMI_vs_leidenalg_best={nmi_vs_best:.4f}")
+
+        if len(mode_results) > 1:
+            mode_aris = []
+            for i in range(len(mode_results)):
+                for j in range(i + 1, len(mode_results)):
+                    mode_aris.append(adjusted_rand_score(
+                        mode_results[i]["membership"], mode_results[j]["membership"]))
+            mode_mean_aris[mode_key] = np.mean(mode_aris)
+            lines.append(f"    trial-to-trial ARI: mean={np.mean(mode_aris):.4f} "
+                f"min={np.min(mode_aris):.4f} max={np.max(mode_aris):.4f}")
+
+    lines.append("")
+    if mode_mean_aris.get("seed", 0) > 0.9999 and mode_mean_aris.get("perturbation", 0) > 0.9999:
+        lines.append("  Diagnostic: BOTH modes show trial-to-trial ARI ~1.0 -- this graph likely")
+        lines.append(f"  has one dominant modularity basin for {backend_name}. Best-of-N and")
+        lines.append("  consensus ensembling would have nothing real to ensemble over here.")
+    elif mode_mean_aris.get("seed", 1.0) < 0.9999:
+        lines.append("  Diagnostic: 'seed' mode alone already shows real trial-to-trial diversity")
+        lines.append("  -- a genuine best-of-N multi-restart search is possible here.")
+    elif mode_mean_aris.get("perturbation", 1.0) < mode_mean_aris.get("seed", 0) - 0.01:
+        lines.append("  Diagnostic: 'perturbation' mode shows lower trial-to-trial ARI than 'seed'")
+        lines.append("  mode -- there IS real diversity to ensemble over via input perturbation,")
+        lines.append("  even though varying the seed alone does not produce any.")
+    else:
+        lines.append("  Diagnostic: inconclusive from these numbers alone -- inspect the raw ARI")
+        lines.append("  values above directly.")
+
+    mean_leidenalg_wall = np.mean([r["wall_seconds"] for r in leidenalg_results])
+    mean_candidate_wall = np.mean([r["wall_seconds"] for r in candidate_results["seed"]])
+    lines.append("")
+    lines.append(f"  mean wall/run: leidenalg={mean_leidenalg_wall:.3f}s "
+        f"{short_name or backend_name} (seed mode)={mean_candidate_wall:.3f}s "
+        f"speedup={mean_leidenalg_wall / mean_candidate_wall:.2f}x")
+
+    return "\n".join(lines)
+
+
+def summarize(leidenalg_results, cugraph_results, cugraph_error, cugraph_seed_param,
+        igraph_native_results, igraph_native_error):
+    from sklearn.metrics import adjusted_rand_score
 
     lines = []
     lines.append("=== leidenalg (CPU, current backend) ===")
@@ -431,50 +731,25 @@ def summarize(leidenalg_results, cugraph_results, cugraph_error, cugraph_seed_pa
         lines.append(f"  seed-to-seed ARI (natural variability baseline): "
             f"mean={np.mean(aris):.4f} min={np.min(aris):.4f} max={np.max(aris):.4f}")
 
+    cugraph_seed_note = "seed/random-state parameter used: " + (cugraph_seed_param or
+        "NONE FOUND on cugraph.leiden -- 'seed' mode below is not independently randomized")
+    lines.append(_summarize_candidate_backend("cuGraph Leiden (GPU)", cugraph_results,
+        cugraph_error, leidenalg_results, best, seed_note=cugraph_seed_note,
+        short_name="cugraph"))
+
+    igraph_native_seed_note = ("seed control: Python's global random.seed() -- "
+        "community_leiden has no per-call seed kwarg")
+    lines.append(_summarize_candidate_backend("igraph native Leiden (CPU, community_leiden)",
+        igraph_native_results, igraph_native_error, leidenalg_results, best,
+        seed_note=igraph_native_seed_note, short_name="igraph_native"))
+
     lines.append("")
-    lines.append("=== cuGraph Leiden (GPU) ===")
-    if cugraph_results is None:
-        lines.append(f"  SKIPPED -- cugraph/cudf not available: {cugraph_error}")
-        lines.append("  Install RAPIDS cugraph on a CUDA machine to run this section.")
-    else:
-        seed_note = cugraph_seed_param or \
-            "NONE FOUND on cugraph.leiden -- trials are NOT independently randomized"
-        lines.append(f"  seed/random-state parameter used: {seed_note}")
-        for r in cugraph_results:
-            ari_vs_best = adjusted_rand_score(r["membership"], best["membership"])
-            nmi_vs_best = normalized_mutual_info_score(r["membership"], best["membership"])
-            lines.append(f"  trial={r['trial']}: quality={r['quality']:.6f} "
-                f"n_clusters={len(set(r['membership']))} wall={r['wall_seconds']:.3f}s "
-                f"ARI_vs_leidenalg_best={ari_vs_best:.4f} "
-                f"NMI_vs_leidenalg_best={nmi_vs_best:.4f}")
-
-        if len(cugraph_results) > 1:
-            aris = []
-            for i in range(len(cugraph_results)):
-                for j in range(i + 1, len(cugraph_results)):
-                    aris.append(adjusted_rand_score(
-                        cugraph_results[i]["membership"],
-                        cugraph_results[j]["membership"]))
-            lines.append(f"  cugraph trial-to-trial ARI: mean={np.mean(aris):.4f} "
-                f"min={np.min(aris):.4f} max={np.max(aris):.4f}")
-            if cugraph_seed_param is None and np.mean(aris) > 0.9999:
-                lines.append("  (trial-to-trial ARI is ~1.0 AND no seed parameter was found --")
-                lines.append("   these trials are identical repeats, not an independent ensemble.")
-                lines.append("   Do not read this as cugraph being deterministic in general.)")
-
-        mean_leidenalg_wall = np.mean([r["wall_seconds"] for r in leidenalg_results])
-        mean_cugraph_wall = np.mean([r["wall_seconds"] for r in cugraph_results])
-        lines.append("")
-        lines.append(f"  mean wall/run: leidenalg={mean_leidenalg_wall:.3f}s "
-            f"cugraph={mean_cugraph_wall:.3f}s "
-            f"speedup={mean_leidenalg_wall / mean_cugraph_wall:.2f}x")
-        lines.append("")
-        lines.append("  Interpretation guide: if cuGraph's ARI-vs-leidenalg-best is")
-        lines.append("  comparable to leidenalg's OWN seed-to-seed ARI above, cuGraph")
-        lines.append("  is landing in the same range of 'plausible good partitions' that")
-        lines.append("  leidenalg itself produces across seeds -- not a red flag on its")
-        lines.append("  own. If it's substantially lower, treat that as a real behavioral")
-        lines.append("  difference to investigate before trusting cuGraph's output.")
+    lines.append("  Interpretation guide: if a candidate backend's ARI-vs-leidenalg-best is")
+    lines.append("  comparable to leidenalg's OWN seed-to-seed ARI above, it's landing in the")
+    lines.append("  same range of 'plausible good partitions' leidenalg itself produces across")
+    lines.append("  seeds -- not a red flag on its own. If it's substantially lower, treat that")
+    lines.append("  as a real behavioral difference to investigate before trusting that")
+    lines.append("  backend's output.")
 
     return "\n".join(lines)
 
@@ -486,10 +761,42 @@ def _format_profile_summary(profile_summary, indent="    "):
     return lines
 
 
+def _summarize_pipeline_candidate(name, cpu, candidate_result, candidate_error, tomtom_comparison):
+    lines = []
+    if candidate_result is None:
+        lines.append(f"  {name}: SKIPPED -- {candidate_error}")
+        return lines
+
+    lines.append(f"  {name}: wall={candidate_result['wall_seconds']:.2f}s "
+        f"n_pos={candidate_result['n_pos']} n_neg={candidate_result['n_neg']}")
+    lines.append(f"    pos_pattern_sizes={candidate_result['pos_sizes']}")
+    lines.append(f"  {name} per-stage breakdown (sorted by cost):")
+    lines.extend(_format_profile_summary(candidate_result["profile_summary"]))
+    lines.append(f"  full-pipeline speedup: "
+        f"{cpu['wall_seconds'] / candidate_result['wall_seconds']:.2f}x")
+
+    counts_match = cpu['n_pos'] == candidate_result['n_pos'] and \
+        cpu['n_neg'] == candidate_result['n_neg']
+    lines.append(f"  pattern count match: "
+        f"{'YES' if counts_match else 'NO -- investigate before trusting'}")
+    if counts_match and cpu['pos_sizes'] and cpu['pos_sizes'] == candidate_result['pos_sizes']:
+        lines.append("  pos_pattern_sizes match exactly, in the same sorted order --")
+        lines.append("  strong (though not conclusive) sign the substitution is behaving well.")
+    elif counts_match:
+        lines.append("  pattern counts match but per-pattern sizes differ -- same NUMBER of")
+        lines.append("  patterns found, but not necessarily the same patterns.")
+
+    if tomtom_comparison:
+        lines.append("")
+        lines.append(tomtom_comparison)
+
+    return lines
+
+
 def summarize_pipeline_comparison(result):
     lines = []
     lines.append("")
-    lines.append("=== Full-pipeline substitution: leidenalg vs cuGraph-everywhere ===")
+    lines.append("=== Full-pipeline substitution: leidenalg vs alternates ===")
     cpu = result["cpu"]
     lines.append(f"  leidenalg: wall={cpu['wall_seconds']:.2f}s n_pos={cpu['n_pos']} "
         f"n_neg={cpu['n_neg']}")
@@ -497,36 +804,25 @@ def summarize_pipeline_comparison(result):
     lines.append("  leidenalg per-stage breakdown (sorted by cost):")
     lines.extend(_format_profile_summary(cpu["profile_summary"]))
 
-    if result["gpu"] is None:
-        lines.append(f"  cuGraph: SKIPPED -- {result['gpu_error']}")
-        return "\n".join(lines)
+    lines.append("")
+    lines.append(f"  -- cuGraph (repeat mode: {result.get('cugraph_repeat_mode', 'seed')}) --")
+    if result.get("gpu") is not None:
+        lines.append(f"  cugraph.leiden seed parameter used: "
+            f"{result['seed_param'] or 'NONE FOUND -- see graph-level section above'}")
+    lines.extend(_summarize_pipeline_candidate("cuGraph", cpu, result.get("gpu"),
+        result.get("gpu_error"), result.get("tomtom_comparison_cugraph")))
 
-    gpu = result["gpu"]
-    seed_note = result["seed_param"] or "NONE FOUND -- see graph-level section above"
-    lines.append(f"  cugraph.leiden seed parameter used: {seed_note}")
-    lines.append(f"  cuGraph:   wall={gpu['wall_seconds']:.2f}s n_pos={gpu['n_pos']} "
-        f"n_neg={gpu['n_neg']}")
-    lines.append(f"    pos_pattern_sizes={gpu['pos_sizes']}")
-    lines.append("  cuGraph per-stage breakdown (sorted by cost):")
-    lines.extend(_format_profile_summary(gpu["profile_summary"]))
-    lines.append(f"  full-pipeline speedup: {cpu['wall_seconds'] / gpu['wall_seconds']:.2f}x")
-    lines.append("  (compare the two breakdowns above to see how much of the gap between this")
-    lines.append("  number and the graph-level speedup is fixed non-Leiden cost -- e.g. coarse/")
-    lines.append("  fine affinity, which don't change between backends -- versus cuGraph-side")
-    lines.append("  overhead like rebuilding a cuDF graph for every subclustering call.)")
+    lines.append("")
+    lines.append(f"  -- igraph native Leiden (repeat mode: "
+        f"{result.get('igraph_native_repeat_mode', 'seed')}) --")
+    lines.extend(_summarize_pipeline_candidate("igraph native", cpu, result.get("igraph_native"),
+        result.get("igraph_native_error"), result.get("tomtom_comparison_igraph_native")))
 
-    counts_match = cpu['n_pos'] == gpu['n_pos'] and cpu['n_neg'] == gpu['n_neg']
-    lines.append(f"  pattern count match: {'YES' if counts_match else 'NO -- investigate before trusting'}")
-    if counts_match and cpu['pos_sizes'] and cpu['pos_sizes'] == gpu['pos_sizes']:
-        lines.append("  pos_pattern_sizes match exactly, in the same sorted order --")
-        lines.append("  strong (though not conclusive) sign the substitution is behaving well.")
-    elif counts_match:
-        lines.append("  pattern counts match but per-pattern sizes differ -- same NUMBER of")
-        lines.append("  patterns found, but not necessarily the same patterns.")
-
-    if result.get("tomtom_comparison"):
-        lines.append("")
-        lines.append(result["tomtom_comparison"])
+    lines.append("")
+    lines.append("  (compare the per-stage breakdowns above to see how much of the gap between")
+    lines.append("  full-pipeline speedup and single-call speedup is fixed non-Leiden cost --")
+    lines.append("  coarse/fine affinity, unchanged across all backends -- versus per-call")
+    lines.append("  graph-construction overhead paid on every subclustering call.)")
 
     return "\n".join(lines)
 
@@ -544,8 +840,28 @@ def main():
              "n_leiden_runs for --run-pipeline-comparison, where it directly "
              "controls how long the leidenalg side of that comparison takes.")
     parser.add_argument("--cugraph-trials", type=int, default=3,
-        help="Number of times to run cugraph.leiden, to gauge its own "
-             "run-to-run variability.")
+        help="Number of times to run each candidate backend (cugraph.leiden AND "
+             "igraph's native community_leiden) per repeat mode ('seed' and "
+             "'perturbation'), to gauge run-to-run variability in the "
+             "graph-level comparison.")
+    parser.add_argument("--jitter-scale", type=float, default=0.05,
+        help="Relative multiplicative jitter applied to edge weights in "
+             "'perturbation' repeat mode (0.05 = +/-5%% noise, seeded per "
+             "trial for reproducibility).")
+    parser.add_argument("--cugraph-repeat-mode", choices=["seed", "perturbation"],
+        default="seed",
+        help="Which repeat mode --run-pipeline-comparison's cuGraph-substituted "
+             "backend uses internally for its 'try n_seeds, keep best' loop. "
+             "'seed' is cheap but may have no diversity (see the graph-level "
+             "diagnostic printed regardless of this flag); 'perturbation' is "
+             "more expensive (rebuilds the graph every trial) but is the "
+             "mode confirmed to actually vary cugraph's output.")
+    parser.add_argument("--igraph-native-repeat-mode", choices=["seed", "perturbation"],
+        default="seed",
+        help="Which repeat mode --run-pipeline-comparison's igraph-native-"
+             "substituted backend uses internally. Unlike cugraph, 'seed' mode "
+             "alone has been shown to give real diversity for igraph's native "
+             "community_leiden, so 'seed' is likely sufficient (and cheaper).")
     parser.add_argument("--capture-index", type=int, default=0,
         help="Which LeidenCluster call to capture the affinity graph from "
              "(0 = first call, typically the largest/most representative).")
@@ -555,9 +871,10 @@ def main():
              "repeat comparisons skip re-running the pipeline.")
     parser.add_argument("--run-pipeline-comparison", action="store_true",
         help="Also run the full TFMoDISco() pipeline end to end with "
-             "leidenalg vs. cugraph-substituted-everywhere, and compare "
-             "final pattern counts/sizes. The leidenalg side is NOT cheap "
-             "-- see the module docstring. Start with a small "
+             "leidenalg vs. cugraph-substituted-everywhere AND vs. "
+             "igraph-native-substituted-everywhere, and compare final "
+             "pattern counts/sizes for each. The leidenalg side is NOT "
+             "cheap -- see the module docstring. Start with a small "
              "--n-leiden-runs before scaling up.")
     parser.add_argument("--report-path", default=None)
     args = parser.parse_args()
@@ -590,17 +907,29 @@ def main():
     print(f"Running leidenalg for {args.n_leiden_runs} seed(s) ...")
     leidenalg_results = run_leidenalg_seeds(affmat, args.n_leiden_runs)
 
-    print(f"Running cugraph.leiden for {args.cugraph_trials} trial(s) ...")
+    print(f"Running cugraph.leiden for {args.cugraph_trials} trial(s) per repeat mode "
+        "(seed, perturbation) ...")
     cugraph_results, cugraph_error, cugraph_seed_param = run_cugraph_leiden(
-        affmat, args.cugraph_trials)
+        affmat, args.cugraph_trials, jitter_scale=args.jitter_scale)
 
-    report = summarize(leidenalg_results, cugraph_results, cugraph_error, cugraph_seed_param)
+    print(f"Running igraph native Leiden for {args.cugraph_trials} trial(s) per repeat mode "
+        "(seed, perturbation) ...")
+    igraph_native_results, igraph_native_error = run_igraph_native_leiden(
+        affmat, args.cugraph_trials, jitter_scale=args.jitter_scale)
+
+    report = summarize(leidenalg_results, cugraph_results, cugraph_error, cugraph_seed_param,
+        igraph_native_results, igraph_native_error)
 
     if args.run_pipeline_comparison:
-        print("Running full end-to-end pipeline comparison "
-            "(leidenalg side is slow -- see module docstring) ...")
+        print(f"Running full end-to-end pipeline comparison (cuGraph repeat_mode="
+            f"{args.cugraph_repeat_mode}, igraph_native repeat_mode="
+            f"{args.igraph_native_repeat_mode}; leidenalg side is slow -- "
+            "see module docstring) ...")
         pipeline_result = run_full_pipeline_comparison(args.data_dir, args.n_peaks,
-            args.window, args.max_seqlets_per_metacluster, args.n_leiden_runs, args.seed)
+            args.window, args.max_seqlets_per_metacluster, args.n_leiden_runs, args.seed,
+            cugraph_repeat_mode=args.cugraph_repeat_mode,
+            igraph_native_repeat_mode=args.igraph_native_repeat_mode,
+            jitter_scale=args.jitter_scale)
         report += "\n" + summarize_pipeline_comparison(pipeline_result)
 
     print()

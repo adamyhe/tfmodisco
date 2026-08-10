@@ -1,0 +1,140 @@
+=== leidenalg (CPU, current backend) ===
+  seed=100: quality=0.518840 n_clusters=8 wall=23.634s
+  seed=200: quality=0.518840 n_clusters=8 wall=14.667s
+  seed=300: quality=0.518840 n_clusters=8 wall=20.696s
+  seed=400: quality=0.518840 n_clusters=8 wall=11.749s
+  seed=500: quality=0.518840 n_clusters=8 wall=10.956s
+  seed=600: quality=0.518840 n_clusters=8 wall=18.687s
+  seed=700: quality=0.519555 n_clusters=7 wall=17.413s
+  seed=800: quality=0.518840 n_clusters=8 wall=18.711s
+  seed=900: quality=0.518840 n_clusters=8 wall=15.697s
+  seed=1000: quality=0.518836 n_clusters=8 wall=18.849s
+  seed=1100: quality=0.518231 n_clusters=7 wall=17.734s
+  seed=1200: quality=0.516721 n_clusters=6 wall=16.306s
+  seed=1300: quality=0.518840 n_clusters=8 wall=16.979s
+  seed=1400: quality=0.519555 n_clusters=7 wall=17.631s
+  seed=1500: quality=0.518840 n_clusters=8 wall=20.559s
+  seed=1600: quality=0.502008 n_clusters=7 wall=16.586s
+  seed=1700: quality=0.518836 n_clusters=8 wall=11.612s
+  seed=1800: quality=0.516395 n_clusters=7 wall=13.965s
+  seed=1900: quality=0.518840 n_clusters=8 wall=24.131s
+  seed=2000: quality=0.518836 n_clusters=8 wall=20.022s
+  seed=2100: quality=0.518836 n_clusters=8 wall=16.479s
+  seed=2200: quality=0.518840 n_clusters=8 wall=21.133s
+  seed=2300: quality=0.518840 n_clusters=8 wall=20.383s
+  seed=2400: quality=0.518836 n_clusters=8 wall=12.733s
+  seed=2500: quality=0.518840 n_clusters=8 wall=26.769s
+  seed=2600: quality=0.518836 n_clusters=8 wall=10.961s
+  seed=2700: quality=0.516721 n_clusters=6 wall=16.434s
+  seed=2800: quality=0.514874 n_clusters=7 wall=19.603s
+  seed=2900: quality=0.514868 n_clusters=7 wall=14.599s
+  seed=3000: quality=0.518840 n_clusters=8 wall=18.423s
+  seed=3100: quality=0.518836 n_clusters=8 wall=14.345s
+  seed=3200: quality=0.518836 n_clusters=8 wall=11.449s
+  seed=3300: quality=0.519555 n_clusters=7 wall=18.767s
+  seed=3400: quality=0.518836 n_clusters=8 wall=11.243s
+  seed=3500: quality=0.513900 n_clusters=6 wall=17.453s
+  seed=3600: quality=0.518836 n_clusters=8 wall=12.553s
+  seed=3700: quality=0.518840 n_clusters=8 wall=12.258s
+  seed=3800: quality=0.518901 n_clusters=7 wall=24.476s
+  seed=3900: quality=0.518840 n_clusters=8 wall=15.956s
+  seed=4000: quality=0.518840 n_clusters=8 wall=15.949s
+  seed=4100: quality=0.518836 n_clusters=8 wall=12.365s
+  seed=4200: quality=0.518840 n_clusters=8 wall=26.750s
+  seed=4300: quality=0.519556 n_clusters=7 wall=24.989s
+  seed=4400: quality=0.518840 n_clusters=8 wall=26.817s
+  seed=4500: quality=0.519555 n_clusters=7 wall=21.067s
+  seed=4600: quality=0.518840 n_clusters=8 wall=16.260s
+  seed=4700: quality=0.518840 n_clusters=8 wall=27.052s
+  seed=4800: quality=0.518840 n_clusters=8 wall=19.896s
+  seed=4900: quality=0.518836 n_clusters=8 wall=12.426s
+  seed=5000: quality=0.518836 n_clusters=8 wall=17.834s
+  best: seed=4300 quality=0.519556
+  seed-to-seed ARI (natural variability baseline): mean=0.9314 min=0.6523 max=1.0000
+
+=== cuGraph Leiden (GPU) ===
+  seed/random-state parameter used: random_state
+  trial=0: quality=0.518821 n_clusters=8 wall=1.207s ARI_vs_leidenalg_best=0.9048 NMI_vs_leidenalg_best=0.9161
+  trial=1: quality=0.518821 n_clusters=8 wall=0.905s ARI_vs_leidenalg_best=0.9048 NMI_vs_leidenalg_best=0.9161
+  trial=2: quality=0.518821 n_clusters=8 wall=0.949s ARI_vs_leidenalg_best=0.9048 NMI_vs_leidenalg_best=0.9161
+  cugraph trial-to-trial ARI: mean=1.0000 min=1.0000 max=1.0000
+
+  mean wall/run: leidenalg=17.680s cugraph=1.020s speedup=17.33x
+
+  Interpretation guide: if cuGraph's ARI-vs-leidenalg-best is
+  comparable to leidenalg's OWN seed-to-seed ARI above, cuGraph
+  is landing in the same range of 'plausible good partitions' that
+  leidenalg itself produces across seeds -- not a red flag on its
+  own. If it's substantially lower, treat that as a real behavioral
+  difference to investigate before trusting cuGraph's output.
+
+=== Full-pipeline substitution: leidenalg vs cuGraph-everywhere ===
+  leidenalg: wall=2528.08s n_pos=18 n_neg=0
+    pos_pattern_sizes=[1373, 666, 626, 581, 534, 460, 132, 132, 106, 91, 66, 57, 55, 39, 32, 24, 23, 22]
+  leidenalg per-stage breakdown (sorted by cost):
+    TFMoDISco.positive_seqlets_to_patterns: 2526.7435s over 1 call(s)
+    seqlets_to_patterns.leiden_cluster: 1589.7221s over 2 call(s)
+    seqlets_to_patterns.detect_spurious_merging: 544.5534s over 1 call(s)
+    seqlets_to_patterns.final_compute_subpatterns: 347.5881s over 18 call(s)
+    compute_subpatterns.leiden_cluster: 346.1934s over 18 call(s)
+    seqlets_to_patterns.coarse_affinity: 18.0842s over 2 call(s)
+    seqlets_to_patterns.fine_affinity: 17.9036s over 2 call(s)
+    seqlets_to_patterns.patterns_from_clusters: 3.2192s over 2 call(s)
+    seqlets_to_patterns.density_adaptation: 2.8369s over 2 call(s)
+    seqlets_to_patterns.filter_by_correlation: 2.6811s over 1 call(s)
+    TFMoDISco.extract_seqlets: 1.3027s over 1 call(s)
+    compute_subpatterns.pairwise_jaccard: 0.5672s over 18 call(s)
+    compute_subpatterns.density_adaptation: 0.4535s over 18 call(s)
+  cugraph.leiden seed parameter used: random_state
+  cuGraph:   wall=276.70s n_pos=18 n_neg=0
+    pos_pattern_sizes=[1332, 960, 672, 563, 428, 230, 143, 104, 77, 74, 54, 52, 44, 40, 33, 30, 29, 21]
+  cuGraph per-stage breakdown (sorted by cost):
+    TFMoDISco.positive_seqlets_to_patterns: 275.3554s over 1 call(s)
+    seqlets_to_patterns.detect_spurious_merging: 123.5848s over 1 call(s)
+    seqlets_to_patterns.final_compute_subpatterns: 70.9262s over 18 call(s)
+    compute_subpatterns.leiden_cluster: 69.6642s over 18 call(s)
+    seqlets_to_patterns.leiden_cluster: 34.4484s over 2 call(s)
+    seqlets_to_patterns.fine_affinity: 21.7474s over 2 call(s)
+    seqlets_to_patterns.coarse_affinity: 11.2809s over 2 call(s)
+    seqlets_to_patterns.patterns_from_clusters: 7.8086s over 2 call(s)
+    seqlets_to_patterns.filter_by_correlation: 2.9003s over 1 call(s)
+    seqlets_to_patterns.density_adaptation: 2.4751s over 2 call(s)
+    TFMoDISco.extract_seqlets: 1.3149s over 1 call(s)
+    compute_subpatterns.pairwise_jaccard: 0.5018s over 18 call(s)
+    compute_subpatterns.density_adaptation: 0.4072s over 18 call(s)
+  full-pipeline speedup: 9.14x
+  (compare the two breakdowns above to see how much of the gap between this
+  number and the graph-level speedup is fixed non-Leiden cost -- e.g. coarse/
+  fine affinity, which don't change between backends -- versus cuGraph-side
+  overhead like rebuilding a cuDF graph for every subclustering call.)
+  pattern count match: YES
+  pattern counts match but per-pattern sizes differ -- same NUMBER of
+  patterns found, but not necessarily the same patterns.
+
+  TOMTOM cross-comparison: cugraph (query, n=18) vs leidenalg (target, n=18), significance threshold p<0.05
+    cugraph[0] (n_seqlets=1332) best match: leidenalg[0] (n_seqlets=1373) p=4.01e-11
+    cugraph[1] (n_seqlets=960) best match: leidenalg[2] (n_seqlets=626) p=4.32e-11
+    cugraph[2] (n_seqlets=672) best match: leidenalg[1] (n_seqlets=666) p=4.09e-11
+    cugraph[3] (n_seqlets=563) best match: leidenalg[3] (n_seqlets=581) p=4.12e-11
+    cugraph[4] (n_seqlets=428) best match: leidenalg[5] (n_seqlets=460) p=4.05e-11
+    cugraph[5] (n_seqlets=230) best match: leidenalg[6] (n_seqlets=132) p=4.14e-11
+    cugraph[6] (n_seqlets=143) best match: leidenalg[7] (n_seqlets=132) p=4.01e-11
+    cugraph[7] (n_seqlets=104) best match: leidenalg[8] (n_seqlets=106) p=4.03e-11
+    cugraph[8] (n_seqlets=77) best match: leidenalg[12] (n_seqlets=55) p=4.32e-11
+    cugraph[9] (n_seqlets=74) best match: leidenalg[9] (n_seqlets=91) p=4.45e-11
+    cugraph[10] (n_seqlets=54) best match: leidenalg[4] (n_seqlets=534) p=6.16e-07
+    cugraph[11] (n_seqlets=52) best match: leidenalg[2] (n_seqlets=626) p=2.60e-08
+    cugraph[12] (n_seqlets=44) best match: leidenalg[11] (n_seqlets=57) p=4.24e-11
+    cugraph[13] (n_seqlets=40) best match: leidenalg[16] (n_seqlets=23) p=5.95e-11
+    cugraph[14] (n_seqlets=33) best match: leidenalg[17] (n_seqlets=22) p=4.23e-11
+    cugraph[15] (n_seqlets=30) best match: leidenalg[13] (n_seqlets=39) p=4.57e-11
+    cugraph[16] (n_seqlets=29) best match: leidenalg[5] (n_seqlets=460) p=4.06e-11
+    cugraph[17] (n_seqlets=21) best match: leidenalg[14] (n_seqlets=32) p=2.52e-08
+
+  Every cugraph pattern has a significant match in leidenalg.
+  Every leidenalg pattern has a significant match in cugraph.
+
+  Possible splits -- multiple cugraph patterns both best-matching the
+  same leidenalg pattern (that leidenalg pattern may have been split by cugraph):
+    leidenalg[2] (n_seqlets=626) <- cugraph[1, 11]
+    leidenalg[5] (n_seqlets=460) <- cugraph[4, 16]

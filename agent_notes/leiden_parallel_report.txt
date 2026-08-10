@@ -1,0 +1,98 @@
+git commit: <fill in via `git rev-parse HEAD`>
+dataset: ENCFF407PRC, n_peaks=5000, window=400
+max_seqlets_per_metacluster=20000, n_leiden_runs=50
+
+=== modisco defaults (n_leiden_jobs=1) ===
+wall_seconds: 3168.63
+peak_rss_mb: 1621.5
+n_pos_patterns: 18
+n_neg_patterns: 0
+  TFMoDISco.extract_seqlets: 1.5364s over 1 call(s)
+  seqlets_to_patterns.coarse_affinity: 16.1729s over 2 call(s)
+  seqlets_to_patterns.fine_affinity: 12.1832s over 2 call(s)
+  seqlets_to_patterns.filter_by_correlation: 2.3122s over 1 call(s)
+  seqlets_to_patterns.density_adaptation: 2.4779s over 2 call(s)
+  seqlets_to_patterns.leiden_cluster: 2153.3902s over 2 call(s)
+  seqlets_to_patterns.patterns_from_clusters: 5.2164s over 2 call(s)
+  seqlets_to_patterns.detect_spurious_merging: 542.4994s over 1 call(s)
+  compute_subpatterns.pairwise_jaccard: 0.1531s over 18 call(s)
+  compute_subpatterns.density_adaptation: 0.3368s over 18 call(s)
+  compute_subpatterns.leiden_cluster: 426.1757s over 18 call(s)
+  seqlets_to_patterns.final_compute_subpatterns: 426.9259s over 18 call(s)
+  TFMoDISco.positive_seqlets_to_patterns: 3161.3366s over 1 call(s)
+
+=== parallel Leiden (n_leiden_jobs=4) ===
+wall_seconds: 975.95
+peak_rss_mb: 4871.9
+n_pos_patterns: 18
+n_neg_patterns: 0
+  TFMoDISco.extract_seqlets: 1.5539s over 1 call(s)
+  seqlets_to_patterns.coarse_affinity: 16.2212s over 2 call(s)
+  seqlets_to_patterns.fine_affinity: 12.1039s over 2 call(s)
+  seqlets_to_patterns.filter_by_correlation: 2.3139s over 1 call(s)
+  seqlets_to_patterns.density_adaptation: 2.4757s over 2 call(s)
+  seqlets_to_patterns.leiden_cluster: 634.7327s over 2 call(s)
+  seqlets_to_patterns.patterns_from_clusters: 5.1812s over 2 call(s)
+  seqlets_to_patterns.detect_spurious_merging: 176.9650s over 1 call(s)
+  compute_subpatterns.pairwise_jaccard: 0.1620s over 18 call(s)
+  compute_subpatterns.density_adaptation: 0.3312s over 18 call(s)
+  compute_subpatterns.leiden_cluster: 115.2348s over 18 call(s)
+  seqlets_to_patterns.final_compute_subpatterns: 115.9850s over 18 call(s)
+  TFMoDISco.positive_seqlets_to_patterns: 966.1379s over 1 call(s)
+
+=== parallel Leiden (n_leiden_jobs=8) ===
+wall_seconds: 572.36
+peak_rss_mb: 8245.2
+n_pos_patterns: 18
+n_neg_patterns: 0
+  TFMoDISco.extract_seqlets: 1.5186s over 1 call(s)
+  seqlets_to_patterns.coarse_affinity: 16.0786s over 2 call(s)
+  seqlets_to_patterns.fine_affinity: 12.0449s over 2 call(s)
+  seqlets_to_patterns.filter_by_correlation: 2.2745s over 1 call(s)
+  seqlets_to_patterns.density_adaptation: 2.4863s over 2 call(s)
+  seqlets_to_patterns.leiden_cluster: 350.0761s over 2 call(s)
+  seqlets_to_patterns.patterns_from_clusters: 5.1157s over 2 call(s)
+  seqlets_to_patterns.detect_spurious_merging: 111.2870s over 1 call(s)
+  compute_subpatterns.pairwise_jaccard: 0.1595s over 18 call(s)
+  compute_subpatterns.density_adaptation: 0.3291s over 18 call(s)
+  compute_subpatterns.leiden_cluster: 61.3299s over 18 call(s)
+  seqlets_to_patterns.final_compute_subpatterns: 62.0738s over 18 call(s)
+  TFMoDISco.positive_seqlets_to_patterns: 561.6273s over 1 call(s)
+
+=== parallel Leiden (n_leiden_jobs=16) ===
+wall_seconds: 373.50
+peak_rss_mb: 14041.6
+n_pos_patterns: 18
+n_neg_patterns: 0
+  TFMoDISco.extract_seqlets: 1.5368s over 1 call(s)
+  seqlets_to_patterns.coarse_affinity: 16.0929s over 2 call(s)
+  seqlets_to_patterns.fine_affinity: 12.4232s over 2 call(s)
+  seqlets_to_patterns.filter_by_correlation: 2.3062s over 1 call(s)
+  seqlets_to_patterns.density_adaptation: 2.4838s over 2 call(s)
+  seqlets_to_patterns.leiden_cluster: 201.8179s over 2 call(s)
+  seqlets_to_patterns.patterns_from_clusters: 5.1211s over 2 call(s)
+  seqlets_to_patterns.detect_spurious_merging: 83.7937s over 1 call(s)
+  compute_subpatterns.pairwise_jaccard: 0.1761s over 18 call(s)
+  compute_subpatterns.density_adaptation: 0.3276s over 18 call(s)
+  compute_subpatterns.leiden_cluster: 41.6471s over 18 call(s)
+  seqlets_to_patterns.final_compute_subpatterns: 42.4082s over 18 call(s)
+  TFMoDISco.positive_seqlets_to_patterns: 366.6065s over 1 call(s)
+
+=== parallel Leiden (n_leiden_jobs=32) ===
+wall_seconds: 314.56
+peak_rss_mb: 26826.7
+n_pos_patterns: 18
+n_neg_patterns: 0
+  TFMoDISco.extract_seqlets: 1.5270s over 1 call(s)
+  seqlets_to_patterns.coarse_affinity: 16.0629s over 2 call(s)
+  seqlets_to_patterns.fine_affinity: 11.9940s over 2 call(s)
+  seqlets_to_patterns.filter_by_correlation: 2.3218s over 1 call(s)
+  seqlets_to_patterns.density_adaptation: 2.4772s over 2 call(s)
+  seqlets_to_patterns.leiden_cluster: 161.7281s over 2 call(s)
+  seqlets_to_patterns.patterns_from_clusters: 5.1589s over 2 call(s)
+  seqlets_to_patterns.detect_spurious_merging: 75.9035s over 1 call(s)
+  compute_subpatterns.pairwise_jaccard: 0.1565s over 18 call(s)
+  compute_subpatterns.density_adaptation: 0.3297s over 18 call(s)
+  compute_subpatterns.leiden_cluster: 30.3123s over 18 call(s)
+  seqlets_to_patterns.final_compute_subpatterns: 31.0572s over 18 call(s)
+  TFMoDISco.positive_seqlets_to_patterns: 306.8631s over 1 call(s)
